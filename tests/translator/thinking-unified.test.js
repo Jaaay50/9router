@@ -72,6 +72,17 @@ describe("applyThinking per provider format", () => {
     expect(out.output_config).toEqual({ effort: "high" });
     expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
   });
+  it("claude fable-5 high → adaptive summarized thinking without budget_tokens", () => {
+    const out = apply("claude", "claude-fable-5", { reasoning_effort: "high" }, "github");
+    expect(out.output_config).toEqual({ effort: "high" });
+    expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
+    expect(out.thinking).not.toHaveProperty("budget_tokens");
+  });
+  it("claude fable-5 none → disabled without adaptive-only fields", () => {
+    const out = apply("claude", "claude-fable-5", { reasoning_effort: "none" }, "github");
+    expect(out.thinking).toEqual({ type: "disabled" });
+    expect(out.output_config).toBeUndefined();
+  });
   it("claude haiku → enabled+budget", () => {
     const out = apply("claude", "claude-haiku-4.5", { reasoning_effort: "high" }, "claude");
     expect(out.thinking).toEqual({ type: "enabled", budget_tokens: 24576 });

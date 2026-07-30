@@ -5,8 +5,18 @@
  * fail with a misleading 400 "does not support Responses API".
  */
 
-import { describe, it, expect, vi } from "vitest";
-import { GithubExecutor } from "../../open-sse/executors/github.js";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+
+const fetchMock = vi.fn();
+vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
+  proxyAwareFetch: (...args) => fetchMock(...args),
+}));
+
+const { GithubExecutor } = await import("../../open-sse/executors/github.js");
+
+beforeEach(() => {
+  fetchMock.mockReset();
+});
 
 describe("GithubExecutor.supportsResponsesEndpoint", () => {
   const exec = new GithubExecutor();
@@ -52,5 +62,32 @@ describe("GithubExecutor.execute cached-route guard (#1062)", () => {
     expect(respSpy).not.toHaveBeenCalled();
     expect(baseSpy).toHaveBeenCalled();
     expect(result.via).toBe("chat");
+  });
+});
+
+describe("GithubExecutor Claude /v1/messages translation", () => {
+  it("sends Fable 5 adaptive thinking without legacy budget_tokens", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("upstream fixture", { status: 400 }));
+
+    const exec = new GithubExecutor();
+    const result = await exec.execute({
+      model: "claude-fable-5",
+      body: {
+        messages: [{ role: "user", content: "hi" }],
+        reasoning_effort: "high",
+      },
+      stream: true,
+      credentials: { copilotToken: "TOKEN" },
+      signal: undefined,
+      log: null,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toContain("/v1/messages");
+    const sentBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(sentBody).toEqual(result.transformedBody);
+    expect(sentBody.output_config).toEqual({ effort: "high" });
+    expect(sentBody.thinking).toEqual({ type: "adaptive", display: "summarized" });
+    expect(sentBody.thinking).not.toHaveProperty("budget_tokens");
   });
 });
