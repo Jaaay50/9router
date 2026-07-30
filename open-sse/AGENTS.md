@@ -24,6 +24,7 @@ Provider-agnostic SSE engine: one OpenAI-style request → any provider (LLM cha
 - Config-driven, DRY, camelCase. NEVER hardcode values, models, or block/role strings — use `config/` + `schema/` constants.
 - Translator pipeline pivots through OpenAI as the intermediate format. A translator registered on the exact `source:target` pair (e.g. `claude:kiro`) runs as a **direct route**, skipping the lossy double-hop.
 - Translators self-register via `register(from, to, reqFn, resFn)` as an import side-effect — new files MUST be imported in `translator/index.js`.
+- When adding or changing a dynamic model family, update `providers/capabilities.js` and test exact plus provider-prefixed IDs. Thinking changes also need an executor-level assertion against the final outbound payload.
 
 ## How to add
 

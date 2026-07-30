@@ -67,7 +67,7 @@ Only add a dedicated test when a provider has a special format that does not rou
 ## 7. Special formats to watch
 
 - `kiro` (binary AWS EventStream), `cursor` (protobuf ConnectRPC), `commandcode` (NDJSON) → responses do NOT round-trip cleanly through openai; test via their executors, not just the translator.
-- Single-provider-two-formats (most fragile): `opencode-go` (minimax models → claude, others openai), `github` (escalates `/chat/completions` → `/responses` at runtime), `xiaomi-tokenplan` (claude alias).
+- Single-provider-multi-format (most fragile): `opencode-go` (minimax models → claude, others openai), `github` (Claude → `/v1/messages`, GPT/Codex → `/responses`, remaining models → `/chat/completions`), `xiaomi-tokenplan` (claude alias).
 - `gemini`/`gemini-cli`: only the LAST system message is kept → earlier system messages are lost.
 
 ## 8. Current known bugs (currently `it.fails`)
