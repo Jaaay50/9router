@@ -48,6 +48,12 @@ describe("getCapabilitiesForModel", () => {
     expect(getCapabilitiesForModel("kiro", "claude-sonnet-5-thinking-agentic")).toMatchObject(claudeSonnet5Expected);
   });
 
+  it("reports GitHub Claude Fable 5 as a 1M adaptive-thinking model", () => {
+    for (const model of ["claude-fable-5", "anthropic/claude-fable-5"]) {
+      expect(getCapabilitiesForModel("github", model)).toMatchObject(claudeSonnet5Expected);
+    }
+  });
+
   it("reports Kiro GPT 5.6 models with the Kiro 272k context window", () => {
     expect(getCapabilitiesForModel("kiro", "gpt-5.6-sol")).toMatchObject(kiroGpt56Expected);
     expect(getCapabilitiesForModel("kiro", "openai/gpt-5.6-sol")).toMatchObject(kiroGpt56Expected);

@@ -124,10 +124,10 @@ describe("OpenAI → Claude context mapping", () => {
       expect(out.thinking).toEqual({ type: "adaptive" });
     });
 
-    // Lifted ceiling: a claude-budget model whose caps declare maxOutput 128000
-    // (e.g. fable) may use the full budget at max effort instead of being pinned
-    // to the conservative 64000 default.
-    it("max effort budget on a 128k model → max_tokens up to 128000, budget preserved just under", () => {
+    // Defensive handling for a legacy budget-shaped payload on a 128k-cap model.
+    // Fable is adaptive; this test only exercises max_tokens reconciliation after
+    // translation when an enabled+budget body is supplied directly.
+    it("legacy budget payload on a 128k model → max_tokens up to 128000, budget preserved just under", () => {
       const out = prepareClaudeRequest({
         model: "claude-fable-5",
         max_tokens: 64000,
