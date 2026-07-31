@@ -45,8 +45,13 @@ describe("handleChatCore upstream errors", () => {
     executeMock.mockResolvedValue({
       response: new Response(JSON.stringify(upstreamBody), {
         status: 400,
+        statusText: "Bad Request",
         headers: {
           "content-type": "application/json",
+          "content-encoding": "gzip",
+          "content-length": "999",
+          "transfer-encoding": "chunked",
+          "set-cookie": "upstream-session=secret",
           "x-request-id": "req_schema_probe",
         },
       }),
@@ -76,7 +81,13 @@ describe("handleChatCore upstream errors", () => {
     expect(result.success).toBe(false);
     expect(result.status).toBe(400);
     expect(result.upstreamResponse.status).toBe(400);
+    expect(result.upstreamResponse.statusText).toBe("Bad Request");
     expect(result.upstreamResponse.headers.get("x-request-id")).toBe("req_schema_probe");
+    expect(result.upstreamResponse.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(result.upstreamResponse.headers.get("content-encoding")).toBeNull();
+    expect(result.upstreamResponse.headers.get("content-length")).toBeNull();
+    expect(result.upstreamResponse.headers.get("transfer-encoding")).toBeNull();
+    expect(result.upstreamResponse.headers.get("set-cookie")).toBeNull();
     await expect(result.upstreamResponse.json()).resolves.toEqual(upstreamBody);
     await expect(result.response.json()).resolves.not.toEqual(upstreamBody);
   });

@@ -37,6 +37,21 @@ export function errorResponse(statusCode, message) {
   });
 }
 
+export function cloneUpstreamErrorResponse(response) {
+  const cloned = response.clone();
+  const headers = new Headers(response.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.delete("transfer-encoding");
+  headers.delete("set-cookie");
+  headers.set("Access-Control-Allow-Origin", "*");
+  return new Response(cloned.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 /**
  * Write error to SSE stream (for streaming)
  * @param {WritableStreamDefaultWriter} writer - Stream writer
