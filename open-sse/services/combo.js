@@ -2,7 +2,7 @@
  * Shared combo (model combo) handling with fallback support
  */
 
-import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
+import { classifyProviderError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
@@ -226,7 +226,7 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, resolveModelProvider = null }) {
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -245,12 +245,19 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   let lastError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;
+  let requestSchemaResponse = null;
+  const blockedProviders = new Set();
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
-    log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
+      const provider = resolveModelProvider ? await resolveModelProvider(modelStr) : null;
+      if (provider && blockedProviders.has(provider)) {
+        log.info("COMBO", `Skipping model ${modelStr}: provider ${provider} rejected request schema`);
+        continue;
+      }
+      log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
       const result = await handleSingleModel(body, modelStr);
       
       // Success (2xx) - return response
@@ -262,8 +269,10 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       // Extract error info from response
       let errorText = result.statusText || "";
       let retryAfter = null;
+      let errorPayload = null;
       try {
         const errorBody = await result.clone().json();
+        errorPayload = errorBody;
         errorText = errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
         retryAfter = errorBody?.retryAfter || null;
       } catch {
@@ -280,10 +289,15 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         try { errorText = JSON.stringify(errorText); } catch { errorText = String(errorText); }
       }
 
-      // Check if should fallback to next model
-      const { shouldFallback, cooldownMs } = checkFallbackError(result.status, errorText);
+      const classification = classifyProviderError(provider, result.status, errorPayload || errorText);
+      if (classification.comboScope === "provider") {
+        if (!requestSchemaResponse) requestSchemaResponse = result;
+        if (provider) blockedProviders.add(provider);
+        log.warn("COMBO", `Provider ${provider || "unknown"} rejected the request schema`, { status: result.status });
+        continue;
+      }
 
-      if (!shouldFallback) {
+      if (!classification.accountFallback) {
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
         return result;
       }
@@ -291,10 +305,10 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       // For transient errors (503/502/504), wait for cooldown before falling through
       // so a briefly-overloaded provider gets a chance to recover rather than being
       // skipped immediately (fixes: combo falls through on transient 503)
-      if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
+      if (classification.cooldownMs && classification.cooldownMs > 0 && classification.cooldownMs <= 5000 &&
           (result.status === 503 || result.status === 502 || result.status === 504)) {
-        log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
-        await new Promise(r => setTimeout(r, cooldownMs));
+        log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${classification.cooldownMs}ms before next`);
+        await new Promise(r => setTimeout(r, classification.cooldownMs));
       }
 
       // Fallback to next model
@@ -308,6 +322,8 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
     }
   }
+
+  if (requestSchemaResponse) return requestSchemaResponse;
 
   // All models failed
   // Use 503 (Service Unavailable) rather than 406 (Not Acceptable) — 406 implies

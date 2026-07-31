@@ -1,4 +1,5 @@
 import "open-sse/index.js";
+import { classifyProviderError } from "open-sse/services/accountFallback.js";
 
 import {
   getProviderCredentials,
@@ -123,7 +124,8 @@ export async function handleChat(request, clientRawRequest = null) {
       log,
       comboName: modelStr,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      resolveModelProvider: async (candidate) => (await getModelInfo(candidate)).provider,
     });
   }
 
@@ -176,7 +178,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         log,
         comboName: modelStr,
         comboStrategy,
-        comboStickyLimit
+        comboStickyLimit,
+        resolveModelProvider: async (candidate) => (await getModelInfo(candidate)).provider,
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
@@ -270,6 +273,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     });
 
     if (result.success) return result.response;
+
+    const classification = classifyProviderError(provider, result.status, result.error);
+    if (classification.category === "request_schema") {
+      log.warn("REQUEST", `Non-retryable Codex request schema error (${result.status})`, { provider });
+      return result.response;
+    }
 
     // Mark account unavailable (auto-calculates cooldown with exponential backoff, or precise resetsAtMs)
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, result.resetsAtMs);
