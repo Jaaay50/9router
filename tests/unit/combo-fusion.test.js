@@ -169,7 +169,13 @@ describe("fusion combo", () => {
 
     expect(response).toBe(firstSchemaResponse);
     expect(handleSingleModel).toHaveBeenCalledOnce();
-    expect(handleSingleModel).toHaveBeenCalledWith(expect.any(Object), "codex/a", true, expect.any(Set));
+    expect(handleSingleModel).toHaveBeenCalledWith(
+      expect.any(Object),
+      "codex/a",
+      true,
+      expect.any(Set),
+      expect.any(Map)
+    );
   });
 
   it("continues an unblocked provider after a Codex schema failure", async () => {
@@ -213,6 +219,28 @@ describe("fusion combo", () => {
     const judgeCall = handleSingleModel.mock.calls.find(([, , isPanel]) => isPanel === undefined);
     expect(judgeCall[1]).toBe("other/c");
     expect(handleSingleModel.mock.calls.filter(([, model]) => model.startsWith("codex/"))).toHaveLength(2);
+  });
+
+  it("tries another provider when the judge returns a schema error", async () => {
+    const handleSingleModel = vi.fn(async (_body, model, isPanel) => {
+      if (model === "codex/judge") return schemaResponse();
+      if (!isPanel) return okResponse("fallback final answer");
+      return okResponse(`answer from ${model}`);
+    });
+
+    const response = await handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["other/a", "other/b"],
+      handleSingleModel,
+      log,
+      judgeModel: "codex/judge",
+      resolveModelProvider: async (model) => model.split("/")[0],
+      tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+    });
+
+    expect(response.ok).toBe(true);
+    expect(handleSingleModel.mock.calls.filter(([, model]) => model === "codex/judge")).toHaveLength(1);
+    expect(handleSingleModel.mock.calls.at(-1)[1]).toBe("other/a");
   });
 
   it("flattens previous tool history and assistant tool_calls into prose for panel calls", async () => {

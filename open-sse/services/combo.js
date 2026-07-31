@@ -511,10 +511,23 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
  * @param {string} [options.judgeModel] - Judge model; falls back to panel[0]
  * @param {Object} [options.tuning] - Override FUSION_DEFAULTS (minPanel, grace, timeout)
  * @param {Function} [options.resolveModelProvider] - Resolve a model string to its provider
+ * @param {Set<string>} [options.blockedProviders] - Provider exclusions shared by nested combos
+ * @param {Map<string|symbol, Promise>} [options.providerTails] - Per-provider queues shared by nested fusion combos
  * @returns {Promise<Response>}
  */
-export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning, resolveModelProvider = null }) {
+export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning, resolveModelProvider = null, blockedProviders = new Set(), providerTails = new Map() }) {
   const panel = Array.isArray(models) ? models.filter(Boolean) : [];
+  const resolveProvider = async (model) => {
+    if (!resolveModelProvider) return null;
+    try { return await resolveModelProvider(model); } catch { return null; }
+  };
+  const enqueueProviderCall = (provider, unknownKey, task) => {
+    const queueKey = provider || unknownKey;
+    const previous = providerTails.get(queueKey) || Promise.resolve();
+    const call = previous.catch(() => {}).then(task);
+    providerTails.set(queueKey, call);
+    return call;
+  };
   if (panel.length === 0) {
     return new Response(
       JSON.stringify({ error: { message: "Fusion combo has no models" } }),
@@ -524,16 +537,21 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
 
   // A single-model fusion has nothing to fuse — just answer directly.
   if (panel.length === 1) {
-    return handleSingleModel(body, panel[0]);
+    const provider = await resolveProvider(panel[0]);
+    return enqueueProviderCall(provider, Symbol("unknown-provider"), () => {
+      if (provider && blockedProviders.has(provider)) {
+        return new Response(
+          JSON.stringify({ error: { message: `Provider ${provider} rejected the request schema` } }),
+          { status: 503, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+        );
+      }
+      return handleSingleModel(body, panel[0], undefined, blockedProviders, providerTails);
+    });
   }
 
   const cfg = { ...FUSION_DEFAULTS, ...(tuning || {}) };
   const minPanel = Math.min(Math.max(2, cfg.minPanel), panel.length);
   const judge = judgeModel && judgeModel.trim() ? judgeModel.trim() : panel[0];
-  const resolveProvider = async (model) => {
-    if (!resolveModelProvider) return null;
-    try { return await resolveModelProvider(model); } catch { return null; }
-  };
   log.info("FUSION", `Combo "${comboName}" | panel=${panel.length} [${panel.join(", ")}] | judge=${judge} | quorum=${minPanel}`);
 
   // 1. Fan out to the panel in parallel: non-streaming, tools stripped (we want prose).
@@ -548,45 +566,44 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
 
   const t0 = Date.now();
-  const blockedProviders = new Set();
   let requestSchemaResponse = null;
   let acceptingPanelCalls = true;
   const providers = resolveModelProvider
     ? await Promise.all(panel.map(resolveProvider))
     : panel.map(() => null);
-  const providerTails = new Map();
+  const unknownProviderQueue = Symbol("unknown-provider");
+  const recordSchemaFailure = async (result, provider, blockedBefore) => {
+    let errorPayload = null;
+    let errorText = result?.statusText || "";
+    try {
+      errorPayload = await result.clone().json();
+      errorText = errorPayload?.error?.message || errorPayload?.error || errorPayload?.message || errorText;
+    } catch { /* non-JSON provider error */ }
+    const nestedSchemaProvider = provider ? null : [...blockedProviders].find((item) => !blockedBefore.has(item));
+    const errorProvider = provider || nestedSchemaProvider;
+    const classification = classifyProviderError(errorProvider, result?.status, errorPayload || errorText);
+    if (classification.comboScope !== "provider") return false;
+    if (!requestSchemaResponse) requestSchemaResponse = result;
+    if (errorProvider) blockedProviders.add(errorProvider);
+    return true;
+  };
   const calls = panel.map((model, index) => {
     const provider = providers[index];
-    const queueKey = resolveModelProvider ? (provider || "__unknown__") : `__model_${index}`;
-    const previous = providerTails.get(queueKey) || Promise.resolve();
-    const call = previous.catch(() => {}).then(async () => {
+    const unknownKey = resolveModelProvider ? unknownProviderQueue : Symbol(`model-${index}`);
+    return enqueueProviderCall(provider, unknownKey, async () => {
       if (!acceptingPanelCalls) return { __dropped: true };
       if (provider && blockedProviders.has(provider)) return { __schemaSkipped: true };
 
       const blockedBefore = new Set(blockedProviders);
       const result = await withTimeout(
-        handleSingleModel(panelBody, model, true, blockedProviders),
+        handleSingleModel(panelBody, model, true, blockedProviders, providerTails),
         cfg.panelHardTimeoutMs
       );
-      if (!result?.ok && !result?.__timeout && !result?.__error) {
-        let errorPayload = null;
-        let errorText = result?.statusText || "";
-        try {
-          errorPayload = await result.clone().json();
-          errorText = errorPayload?.error?.message || errorPayload?.error || errorPayload?.message || errorText;
-        } catch { /* non-JSON provider error */ }
-        const nestedSchemaProvider = provider ? null : [...blockedProviders].find((item) => !blockedBefore.has(item));
-        const errorProvider = provider || nestedSchemaProvider;
-        const classification = classifyProviderError(errorProvider, result?.status, errorPayload || errorText);
-        if (classification.comboScope === "provider") {
-          if (!requestSchemaResponse) requestSchemaResponse = result;
-          if (errorProvider) blockedProviders.add(errorProvider);
-        }
+      if (acceptingPanelCalls && !result?.ok && !result?.__timeout && !result?.__error) {
+        await recordSchemaFailure(result, provider, blockedBefore);
       }
       return result;
     });
-    providerTails.set(queueKey, call);
-    return call;
   });
   const settled = await collectPanel(calls, { ...cfg, minPanel });
   acceptingPanelCalls = false;
@@ -629,26 +646,35 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
     log.info("FUSION", `Only ${answers[0].model} succeeded — answering directly (no fusion)`);
     const answerProvider = await resolveProvider(answers[0].model);
     if (answerProvider && blockedProviders.has(answerProvider)) return answers[0].response;
-    return handleSingleModel(body, answers[0].model, undefined, blockedProviders);
+    const result = await enqueueProviderCall(answerProvider, Symbol("unknown-provider"), () => {
+      if (answerProvider && blockedProviders.has(answerProvider)) return null;
+      return handleSingleModel(body, answers[0].model, undefined, blockedProviders, providerTails);
+    });
+    return result || requestSchemaResponse || answers[0].response;
   }
 
   // 4. Judge analyzes + writes one final answer (streams to client if requested).
   const judgeBody = appendUserTurn(body, buildJudgePrompt(answers));
-  let selectedJudge = judge;
-  if (resolveModelProvider) {
-    const judgeProvider = await resolveProvider(judge);
-    if (judgeProvider && blockedProviders.has(judgeProvider)) {
-      selectedJudge = null;
-      for (const answer of answers) {
-        const answerProvider = await resolveProvider(answer.model);
-        if (!answerProvider || !blockedProviders.has(answerProvider)) {
-          selectedJudge = answer.model;
-          break;
-        }
-      }
-      if (!selectedJudge) return answers[0].response;
-    }
+  const judgeCandidates = [judge, ...answers.map(({ model }) => model)];
+  const attemptedProviders = new Set();
+  const attemptedModels = new Set();
+  for (const candidate of judgeCandidates) {
+    if (attemptedModels.has(candidate)) continue;
+    attemptedModels.add(candidate);
+    const provider = await resolveProvider(candidate);
+    if (provider && (blockedProviders.has(provider) || attemptedProviders.has(provider))) continue;
+    if (provider) attemptedProviders.add(provider);
+
+    log.info("FUSION", `Judging ${answers.length} answers with ${candidate}`);
+    const blockedBefore = new Set(blockedProviders);
+    const result = await enqueueProviderCall(provider, Symbol("unknown-provider"), () => {
+      if (provider && blockedProviders.has(provider)) return null;
+      return handleSingleModel(judgeBody, candidate, undefined, blockedProviders, providerTails);
+    });
+    if (!result) continue;
+    if (result.ok) return result;
+    const isSchemaFailure = await recordSchemaFailure(result, provider, blockedBefore);
+    if (!isSchemaFailure) return result;
   }
-  log.info("FUSION", `Judging ${answers.length} answers with ${selectedJudge}`);
-  return handleSingleModel(judgeBody, selectedJudge, undefined, blockedProviders);
+  return requestSchemaResponse || answers[0].response;
 }

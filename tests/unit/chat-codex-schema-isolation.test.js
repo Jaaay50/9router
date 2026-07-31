@@ -168,6 +168,127 @@ describe("Codex schema 400 account isolation", () => {
     expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
   });
 
+  it("shares provider blocks with a nested fusion combo", async () => {
+    const schemaResponse = new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 });
+    mocks.getSettings.mockResolvedValue({
+      requireApiKey: false,
+      comboStrategies: { innerFusion: { fallbackStrategy: "fusion" } },
+    });
+    mocks.getComboModels.mockImplementation(async (model) => {
+      if (model === "outer") return ["cx/gpt-5.6-sol", "innerFusion"];
+      if (model === "innerFusion") return ["cx/gpt-5.6-codex", "other/model"];
+      return null;
+    });
+    mocks.getModelInfo.mockImplementation(async (model) => {
+      if (model === "outer" || model === "innerFusion") return { provider: null, model };
+      const [prefix, resolvedModel] = model.split("/");
+      return { provider: prefix === "cx" ? "codex" : "other", model: resolvedModel };
+    });
+    mocks.handleChatCore.mockImplementation(async ({ modelInfo }) => {
+      if (modelInfo.provider === "codex") {
+        return {
+          success: false,
+          status: 400,
+          error: SCHEMA_ERROR,
+          response: new Response("synthetic", { status: 400 }),
+          upstreamResponse: schemaResponse,
+        };
+      }
+      return {
+        success: true,
+        response: new Response(JSON.stringify({
+          output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      };
+    });
+
+    const response = await handleChat(request({ model: "outer" }));
+    const calledProviders = mocks.handleChatCore.mock.calls.map(([options]) => options.modelInfo.provider);
+
+    expect(response.ok).toBe(true);
+    expect(calledProviders.filter((provider) => provider === "codex")).toHaveLength(1);
+    expect(calledProviders.filter((provider) => provider === "other")).toHaveLength(2);
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
+  it("skips a blocked provider in a single-model fusion", async () => {
+    const schemaResponse = new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 });
+    mocks.getSettings.mockResolvedValue({
+      requireApiKey: false,
+      comboStrategies: { singleFusion: { fallbackStrategy: "fusion" } },
+    });
+    mocks.getComboModels.mockImplementation(async (model) => {
+      if (model === "outer") return ["cx/gpt-5.6-sol", "singleFusion"];
+      if (model === "singleFusion") return ["cx/gpt-5.6-codex"];
+      return null;
+    });
+    mocks.getModelInfo.mockImplementation(async (model) => {
+      if (model === "outer" || model === "singleFusion") return { provider: null, model };
+      return { provider: "codex", model: model.split("/").at(-1) };
+    });
+    mocks.handleChatCore.mockResolvedValue({
+      success: false,
+      status: 400,
+      error: SCHEMA_ERROR,
+      response: new Response("synthetic", { status: 400 }),
+      upstreamResponse: schemaResponse,
+    });
+
+    const response = await handleChat(request({ model: "outer" }));
+
+    expect(response).toBe(schemaResponse);
+    expect(mocks.handleChatCore).toHaveBeenCalledOnce();
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
+  it("shares provider queues across nested fusion combos", async () => {
+    mocks.getSettings.mockResolvedValue({
+      requireApiKey: false,
+      comboStrategies: {
+        outerFusion: { fallbackStrategy: "fusion" },
+        innerFusion: { fallbackStrategy: "fusion" },
+      },
+    });
+    mocks.getComboModels.mockImplementation(async (model) => {
+      if (model === "outerFusion") return ["cx/gpt-5.6-sol", "innerFusion", "other/a"];
+      if (model === "innerFusion") return ["cx/gpt-5.6-codex", "other/b"];
+      return null;
+    });
+    mocks.getModelInfo.mockImplementation(async (model) => {
+      if (model === "outerFusion" || model === "innerFusion") return { provider: null, model };
+      const [prefix, resolvedModel] = model.split("/");
+      return { provider: prefix === "cx" ? "codex" : "other", model: resolvedModel };
+    });
+    mocks.handleChatCore.mockImplementation(async ({ modelInfo }) => {
+      if (modelInfo.provider === "codex") {
+        return {
+          success: false,
+          status: 400,
+          error: SCHEMA_ERROR,
+          response: new Response("synthetic", { status: 400 }),
+          upstreamResponse: new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 }),
+        };
+      }
+      return {
+        success: true,
+        response: new Response(JSON.stringify({
+          output: [{ type: "message", content: [{ type: "output_text", text: `ok-${modelInfo.model}` }] }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } }),
+      };
+    });
+
+    const response = await handleChat(request({ model: "outerFusion" }));
+    const calledProviders = mocks.handleChatCore.mock.calls.map(([options]) => options.modelInfo.provider);
+
+    expect(response.ok).toBe(true);
+    expect(calledProviders.filter((provider) => provider === "codex")).toHaveLength(1);
+    expect(calledProviders.filter((provider) => provider === "other").length).toBeGreaterThanOrEqual(2);
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
   it("does not replay a stored lastError when all accounts were already locked", async () => {
     const retryAfter = new Date(Date.now() + 45000).toISOString();
     mocks.getProviderCredentials.mockResolvedValue({

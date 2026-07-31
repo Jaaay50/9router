@@ -100,13 +100,13 @@ export async function handleChat(request, clientRawRequest = null) {
       return handleFusionChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m, isPanel, blockedProviders) => {
+        handleSingleModel: (b, m, isPanel, blockedProviders, providerTails) => {
           let cleanRawReq = clientRawRequest;
           if (isPanel && clientRawRequest) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, blockedProviders);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, blockedProviders, providerTails);
         },
         log,
         comboName: modelStr,
@@ -137,7 +137,7 @@ export async function handleChat(request, clientRawRequest = null) {
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, blockedProviders = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, blockedProviders = null, providerTails = null) {
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
@@ -155,19 +155,21 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         return handleFusionChat({
           body,
           models: comboModels,
-          handleSingleModel: (b, m, isPanel, sharedBlockedProviders) => {
+          handleSingleModel: (b, m, isPanel, sharedBlockedProviders, sharedProviderTails) => {
             let cleanRawReq = clientRawRequest;
             if (isPanel && clientRawRequest) {
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, sharedBlockedProviders);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, sharedBlockedProviders, sharedProviderTails);
           },
           log,
           comboName: modelStr,
           judgeModel: comboStrategies[modelStr]?.judgeModel,
           tuning: comboStrategies[modelStr]?.fusionTuning,
           resolveModelProvider: async (candidate) => (await getModelInfo(candidate)).provider,
+          ...(blockedProviders ? { blockedProviders } : {}),
+          ...(providerTails ? { providerTails } : {}),
         });
       }
 
@@ -176,7 +178,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return handleComboChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m, sharedBlockedProviders) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, sharedBlockedProviders),
+        handleSingleModel: (b, m, sharedBlockedProviders) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, sharedBlockedProviders, providerTails),
         log,
         comboName: modelStr,
         comboStrategy,
