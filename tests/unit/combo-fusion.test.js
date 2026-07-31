@@ -259,22 +259,25 @@ describe("fusion combo", () => {
   it("returns completed panel output when every judge provider still has a straggler", async () => {
     const slowGate = deferred();
     const slowDone = deferred();
+    const firstResponse = okResponse("fast-p/first");
     const handleSingleModel = vi.fn(async (_body, model, isPanel) => {
       if (model === "p/slow") {
         await slowGate.promise;
         slowDone.resolve();
         return okResponse("slow");
       }
+      if (model === "codex/schema") return schemaResponse();
       if (!isPanel) throw new Error("busy provider was reused as judge");
+      if (model === "p/first") return firstResponse;
       return okResponse(`fast-${model}`);
     });
 
     const fusion = handleFusionChat({
       body: { messages: [{ role: "user", content: "Q" }] },
-      models: ["p/first", "p/second", "p/slow"],
+      models: ["p/first", "p/second", "p/slow", "codex/schema"],
       handleSingleModel,
       log,
-      resolveModelProvider: async () => "p",
+      resolveModelProvider: async (model) => model.split("/")[0],
       tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
     });
     let raced;
@@ -290,9 +293,9 @@ describe("fusion combo", () => {
     await slowDone.promise;
 
     expect(raced.timedOut).not.toBe(true);
-    expect(raced.response.ok).toBe(true);
+    expect(raced.response).toBe(firstResponse);
     expect(handleSingleModel.mock.calls.filter(([, , isPanel]) => isPanel === undefined)).toHaveLength(0);
-    expect(handleSingleModel).toHaveBeenCalledTimes(3);
+    expect(handleSingleModel).toHaveBeenCalledTimes(4);
   });
 
   it("does not retry a lone answer through its busy provider", async () => {

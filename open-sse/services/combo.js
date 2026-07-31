@@ -694,6 +694,8 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   const judgeCandidates = [judge, ...answers.map(({ model }) => model)];
   const attemptedProviders = new Set();
   const attemptedModels = new Set();
+  let judgeAttempted = false;
+  let busyJudgeCandidate = false;
   for (const candidate of judgeCandidates) {
     if (attemptedModels.has(candidate)) continue;
     attemptedModels.add(candidate);
@@ -702,10 +704,14 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
       blockedProviders.has(provider)
       || attemptedProviders.has(provider)
     )) continue;
-    if (isPanelProviderBusy(candidate, provider)) continue;
+    if (isPanelProviderBusy(candidate, provider)) {
+      busyJudgeCandidate = true;
+      continue;
+    }
     if (provider) attemptedProviders.add(provider);
 
     log.info("FUSION", `Judging ${answers.length} answers with ${candidate}`);
+    judgeAttempted = true;
     const blockedBefore = new Set(blockedProviders);
     const judgeUnknownKey = resolveModelProvider ? unknownProviderQueue : Symbol("unknown-provider");
     const result = await enqueueProviderCall(provider, judgeUnknownKey, () => {
@@ -717,5 +723,6 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
     const isSchemaFailure = await recordSchemaFailure(result, provider, blockedBefore);
     if (!isSchemaFailure) return result;
   }
+  if (!judgeAttempted && busyJudgeCandidate) return answers[0].response;
   return requestSchemaResponse || answers[0].response;
 }
