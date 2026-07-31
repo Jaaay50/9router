@@ -17,6 +17,15 @@ function errResponse(status = 500) {
   return make();
 }
 
+function schemaResponse() {
+  return new Response(JSON.stringify({ error: {
+    type: "invalid_request_error",
+    code: "invalid_value",
+    param: "input[434].id",
+    message: "Invalid 'input[434].id'. Expected an ID that begins with 'ctc'.",
+  } }), { status: 400, headers: { "Content-Type": "application/json" } });
+}
+
 describe("fusion combo", () => {
   it("answers directly with a single-model panel (nothing to fuse)", async () => {
     const handleSingleModel = vi.fn(async () => okResponse("solo"));
@@ -140,6 +149,70 @@ describe("fusion combo", () => {
       tuning: { minPanel: 2, stragglerGraceMs: 50, panelHardTimeoutMs: 5000 },
     });
     expect(res.status).toBe(503);
+  });
+
+  it("stops a provider after its first schema failure", async () => {
+    const firstSchemaResponse = schemaResponse();
+    const handleSingleModel = vi.fn(async (_body, model) => {
+      if (model === "codex/a") return firstSchemaResponse;
+      return schemaResponse();
+    });
+
+    const response = await handleFusionChat({
+      body: { input: [{ role: "user", content: "Q" }] },
+      models: ["codex/a", "codex/b", "codex/c"],
+      handleSingleModel,
+      log,
+      resolveModelProvider: async () => "codex",
+      tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+    });
+
+    expect(response).toBe(firstSchemaResponse);
+    expect(handleSingleModel).toHaveBeenCalledOnce();
+    expect(handleSingleModel).toHaveBeenCalledWith(expect.any(Object), "codex/a", true, expect.any(Set));
+  });
+
+  it("continues an unblocked provider after a Codex schema failure", async () => {
+    const handleSingleModel = vi.fn(async (_body, model) => {
+      if (model === "codex/a") return schemaResponse();
+      if (model === "codex/b") throw new Error("blocked Codex model was called");
+      return okResponse("other answer");
+    });
+
+    const response = await handleFusionChat({
+      body: { input: [{ role: "user", content: "Q" }] },
+      models: ["codex/a", "codex/b", "other/c"],
+      handleSingleModel,
+      log,
+      resolveModelProvider: async (model) => model.split("/")[0],
+      tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+    });
+
+    expect(response.ok).toBe(true);
+    expect(handleSingleModel.mock.calls.filter(([, model]) => model === "codex/a")).toHaveLength(1);
+    expect(handleSingleModel.mock.calls.filter(([, model]) => model === "codex/b")).toHaveLength(0);
+    expect(handleSingleModel.mock.calls.filter(([, model]) => model === "other/c")).toHaveLength(2);
+  });
+
+  it("does not reuse a blocked provider as the judge", async () => {
+    const handleSingleModel = vi.fn(async (_body, model, isPanel) => {
+      if (model === "codex/b") return schemaResponse();
+      if (!isPanel) return okResponse("final answer");
+      return okResponse(`answer from ${model}`);
+    });
+
+    await handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["codex/a", "codex/b", "other/c"],
+      handleSingleModel,
+      log,
+      resolveModelProvider: async (model) => model.split("/")[0],
+      tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+    });
+
+    const judgeCall = handleSingleModel.mock.calls.find(([, , isPanel]) => isPanel === undefined);
+    expect(judgeCall[1]).toBe("other/c");
+    expect(handleSingleModel.mock.calls.filter(([, model]) => model.startsWith("codex/"))).toHaveLength(2);
   });
 
   it("flattens previous tool history and assistant tool_calls into prose for panel calls", async () => {

@@ -510,9 +510,10 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
  * @param {string} [options.comboName] - Combo name (logging)
  * @param {string} [options.judgeModel] - Judge model; falls back to panel[0]
  * @param {Object} [options.tuning] - Override FUSION_DEFAULTS (minPanel, grace, timeout)
+ * @param {Function} [options.resolveModelProvider] - Resolve a model string to its provider
  * @returns {Promise<Response>}
  */
-export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning }) {
+export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning, resolveModelProvider = null }) {
   const panel = Array.isArray(models) ? models.filter(Boolean) : [];
   if (panel.length === 0) {
     return new Response(
@@ -529,6 +530,10 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   const cfg = { ...FUSION_DEFAULTS, ...(tuning || {}) };
   const minPanel = Math.min(Math.max(2, cfg.minPanel), panel.length);
   const judge = judgeModel && judgeModel.trim() ? judgeModel.trim() : panel[0];
+  const resolveProvider = async (model) => {
+    if (!resolveModelProvider) return null;
+    try { return await resolveModelProvider(model); } catch { return null; }
+  };
   log.info("FUSION", `Combo "${comboName}" | panel=${panel.length} [${panel.join(", ")}] | judge=${judge} | quorum=${minPanel}`);
 
   // 1. Fan out to the panel in parallel: non-streaming, tools stripped (we want prose).
@@ -543,8 +548,48 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
 
   const t0 = Date.now();
-  const calls = panel.map((m) => withTimeout(handleSingleModel(panelBody, m, true), cfg.panelHardTimeoutMs));
+  const blockedProviders = new Set();
+  let requestSchemaResponse = null;
+  let acceptingPanelCalls = true;
+  const providers = resolveModelProvider
+    ? await Promise.all(panel.map(resolveProvider))
+    : panel.map(() => null);
+  const providerTails = new Map();
+  const calls = panel.map((model, index) => {
+    const provider = providers[index];
+    const queueKey = resolveModelProvider ? (provider || "__unknown__") : `__model_${index}`;
+    const previous = providerTails.get(queueKey) || Promise.resolve();
+    const call = previous.catch(() => {}).then(async () => {
+      if (!acceptingPanelCalls) return { __dropped: true };
+      if (provider && blockedProviders.has(provider)) return { __schemaSkipped: true };
+
+      const blockedBefore = new Set(blockedProviders);
+      const result = await withTimeout(
+        handleSingleModel(panelBody, model, true, blockedProviders),
+        cfg.panelHardTimeoutMs
+      );
+      if (!result?.ok && !result?.__timeout && !result?.__error) {
+        let errorPayload = null;
+        let errorText = result?.statusText || "";
+        try {
+          errorPayload = await result.clone().json();
+          errorText = errorPayload?.error?.message || errorPayload?.error || errorPayload?.message || errorText;
+        } catch { /* non-JSON provider error */ }
+        const nestedSchemaProvider = provider ? null : [...blockedProviders].find((item) => !blockedBefore.has(item));
+        const errorProvider = provider || nestedSchemaProvider;
+        const classification = classifyProviderError(errorProvider, result?.status, errorPayload || errorText);
+        if (classification.comboScope === "provider") {
+          if (!requestSchemaResponse) requestSchemaResponse = result;
+          if (errorProvider) blockedProviders.add(errorProvider);
+        }
+      }
+      return result;
+    });
+    providerTails.set(queueKey, call);
+    return call;
+  });
   const settled = await collectPanel(calls, { ...cfg, minPanel });
+  acceptingPanelCalls = false;
   log.info("FUSION", `fan-out collected in ${Date.now() - t0}ms`);
 
   // 2. Collect successful answers.
@@ -553,6 +598,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
     const res = settled[i];
     const model = panel[i];
     if (!res) { log.warn("FUSION", `Panel ${model} dropped (straggler/timeout)`); continue; }
+    if (res.__dropped || res.__schemaSkipped) { log.warn("FUSION", `Panel ${model} skipped`); continue; }
     if (res.__timeout) { log.warn("FUSION", `Panel ${model} timed out`); continue; }
     if (res.__error) { log.warn("FUSION", `Panel ${model} threw`, { error: res.__error?.message || String(res.__error) }); continue; }
     if (!res.ok) { log.warn("FUSION", `Panel ${model} failed`, { status: res.status }); continue; }
@@ -560,7 +606,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
       const json = await res.clone().json();
       const text = extractPanelText(json);
       if (text) {
-        answers.push({ model, text });
+        answers.push({ model, text, response: res });
         log.info("FUSION", `Panel ${model} ok (${text.length} chars)`);
       } else {
         log.warn("FUSION", `Panel ${model} returned empty content`);
@@ -572,6 +618,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
 
   // 3. Degrade gracefully when the panel is too thin to fuse.
   if (answers.length === 0) {
+    if (requestSchemaResponse) return requestSchemaResponse;
     log.warn("FUSION", "All panel models failed");
     return new Response(
       JSON.stringify({ error: { message: "All fusion panel models failed" } }),
@@ -580,11 +627,28 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
   if (answers.length === 1) {
     log.info("FUSION", `Only ${answers[0].model} succeeded — answering directly (no fusion)`);
-    return handleSingleModel(body, answers[0].model);
+    const answerProvider = await resolveProvider(answers[0].model);
+    if (answerProvider && blockedProviders.has(answerProvider)) return answers[0].response;
+    return handleSingleModel(body, answers[0].model, undefined, blockedProviders);
   }
 
   // 4. Judge analyzes + writes one final answer (streams to client if requested).
   const judgeBody = appendUserTurn(body, buildJudgePrompt(answers));
-  log.info("FUSION", `Judging ${answers.length} answers with ${judge}`);
-  return handleSingleModel(judgeBody, judge);
+  let selectedJudge = judge;
+  if (resolveModelProvider) {
+    const judgeProvider = await resolveProvider(judge);
+    if (judgeProvider && blockedProviders.has(judgeProvider)) {
+      selectedJudge = null;
+      for (const answer of answers) {
+        const answerProvider = await resolveProvider(answer.model);
+        if (!answerProvider || !blockedProviders.has(answerProvider)) {
+          selectedJudge = answer.model;
+          break;
+        }
+      }
+      if (!selectedJudge) return answers[0].response;
+    }
+  }
+  log.info("FUSION", `Judging ${answers.length} answers with ${selectedJudge}`);
+  return handleSingleModel(judgeBody, selectedJudge, undefined, blockedProviders);
 }
