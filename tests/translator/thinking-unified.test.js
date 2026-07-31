@@ -72,6 +72,19 @@ describe("applyThinking per provider format", () => {
     expect(out.output_config).toEqual({ effort: "high" });
     expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
   });
+  it("claude 4.6+ aliases produce adaptive wire payloads without budget_tokens", () => {
+    for (const model of [
+      "anthropic/claude-opus-4-6-thinking",
+      "claude-opus-4.8-fast",
+      "vendor/claude-sonnet-4-7-agentic",
+      "claude-sonnet-5-20260731",
+    ]) {
+      const out = apply("claude", model, { reasoning_effort: "high" }, "claude");
+      expect(out.output_config).toEqual({ effort: "high" });
+      expect(out.thinking).toEqual({ type: "adaptive", display: "summarized" });
+      expect(out.thinking).not.toHaveProperty("budget_tokens");
+    }
+  });
   it("claude fable-5 high → adaptive summarized thinking without budget_tokens", () => {
     const out = apply("claude", "claude-fable-5", { reasoning_effort: "high" }, "github");
     expect(out.output_config).toEqual({ effort: "high" });

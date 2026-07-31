@@ -26,6 +26,8 @@ describe("Claude Opus 1M context capabilities", () => {
     "claude-opus-4-7",
     "claude-opus-4.7",
     "claude-opus-4-6",
+    "anthropic/claude-opus-4.6-fast",
+    "bedrock/us.anthropic.claude-opus-4-8-20260731-v1:0",
   ]) {
     it(`resolves ${model} to a 1M context window`, () => {
       expect(getCapabilitiesForModel("cc", model)).toMatchObject(expected);
@@ -33,6 +35,33 @@ describe("Claude Opus 1M context capabilities", () => {
   }
 
   it("keeps the older Opus 4.5 at the standard 200k context", () => {
-    expect(getCapabilitiesForModel("cc", "claude-opus-4-5-20251101").contextWindow).toBe(200000);
+    expect(getCapabilitiesForModel("cc", "claude-opus-4-5-20251101")).toMatchObject({
+      contextWindow: 200000,
+      maxOutput: 64000,
+      thinkingFormat: "claude-budget",
+    });
+  });
+
+  it("does not infer unverified Claude families from nearby version numbers", () => {
+    for (const model of ["claude-opus-5.1-fast", "claude-opus-5-1-fast", "claude-sonnet-4.8-thinking", "claude-fable-4.9"]) {
+      expect(getCapabilitiesForModel("cc", model)).toMatchObject({
+        contextWindow: 200000,
+        maxOutput: 64000,
+        thinkingFormat: "claude-budget",
+      });
+    }
+  });
+
+  it("keeps Haiku and Mythos on their existing budget-thinking capabilities", () => {
+    expect(getCapabilitiesForModel("cc", "claude-haiku-4.5-thinking")).toMatchObject({
+      contextWindow: 200000,
+      maxOutput: 64000,
+      thinkingFormat: "claude-budget",
+    });
+    expect(getCapabilitiesForModel("cc", "claude-mythos-5-agentic")).toMatchObject({
+      contextWindow: 1000000,
+      maxOutput: 128000,
+      thinkingFormat: "claude-budget",
+    });
   });
 });

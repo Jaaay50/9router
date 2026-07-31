@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
+import {
+  getCapabilitiesForModel,
+  PROVIDER_CAPABILITIES,
+} from "../../open-sse/providers/capabilities.js";
 
 describe("getCapabilitiesForModel", () => {
-  const claudeSonnet5Expected = {
+  const claudeAdaptive1mExpected = {
     contextWindow: 1000000,
     maxOutput: 128000,
     thinkingFormat: "claude-adaptive",
@@ -20,37 +23,41 @@ describe("getCapabilitiesForModel", () => {
     search: true,
   };
 
-  it("reports Kiro Claude Opus 5 variants as 1M adaptive-thinking models", () => {
+  it("resolves Claude 4.6+ families and aliases to shared 1M adaptive capabilities", () => {
     for (const model of [
+      "claude-opus-4.6",
+      "claude-opus-4-6-thinking",
+      "anthropic/claude-opus-4.7-fast",
+      "us.anthropic.claude-opus-4-8-agentic",
+      "vendor/anthropic/claude-opus-4.8-20260731-thinking",
+      "vendor/claude-opus-4-8-preview-20260731",
       "claude-opus-5",
-      "anthropic/claude-opus-5",
-      "claude-opus-5-thinking",
-      "claude-opus-5-agentic",
       "claude-opus-5-thinking-agentic",
+      "claude-sonnet-4.6",
+      "claude-sonnet-4-6-thinking",
+      "anthropic/claude-sonnet-4.7-fast-agentic",
+      "vendor/claude-sonnet-5-2026-07-31",
+      "claude-fable-5",
+      "anthropic/claude-fable-5-fast",
     ]) {
-      expect(getCapabilitiesForModel("kiro", model)).toMatchObject(claudeSonnet5Expected);
+      expect(getCapabilitiesForModel("github", model)).toMatchObject(claudeAdaptive1mExpected);
     }
   });
 
-  it("reports Kiro Claude Opus 4.8 as a 1M context model", () => {
-    expect(getCapabilitiesForModel("kiro", "claude-opus-4.8").contextWindow).toBe(1000000);
-    expect(getCapabilitiesForModel("kiro", "anthropic/claude-opus-4.8").contextWindow).toBe(1000000);
-    expect(getCapabilitiesForModel("kiro", "claude-opus-4-8").contextWindow).toBe(1000000);
-    expect(getCapabilitiesForModel("kiro", "claude-opus-4.8-thinking").contextWindow).toBe(1000000);
-    expect(getCapabilitiesForModel("kiro", "claude-opus-4-8-thinking").contextWindow).toBe(1000000);
-  });
+  it("keeps provider-specific overrides ahead of the Claude family resolver", () => {
+    const provider = "capability-test-provider";
+    PROVIDER_CAPABILITIES[provider] = {
+      "claude-opus-4-8-fast": { thinkingFormat: "openai", contextWindow: 300000, maxOutput: 32000 },
+    };
 
-  it("reports Kiro Claude Sonnet 5 as a 1M adaptive-thinking model", () => {
-    expect(getCapabilitiesForModel("kiro", "claude-sonnet-5")).toMatchObject(claudeSonnet5Expected);
-    expect(getCapabilitiesForModel("kiro", "anthropic/claude-sonnet-5")).toMatchObject(claudeSonnet5Expected);
-    expect(getCapabilitiesForModel("kiro", "claude-sonnet-5-thinking")).toMatchObject(claudeSonnet5Expected);
-    expect(getCapabilitiesForModel("kiro", "claude-sonnet-5-agentic")).toMatchObject(claudeSonnet5Expected);
-    expect(getCapabilitiesForModel("kiro", "claude-sonnet-5-thinking-agentic")).toMatchObject(claudeSonnet5Expected);
-  });
-
-  it("reports GitHub Claude Fable 5 as a 1M adaptive-thinking model", () => {
-    for (const model of ["claude-fable-5", "anthropic/claude-fable-5"]) {
-      expect(getCapabilitiesForModel("github", model)).toMatchObject(claudeSonnet5Expected);
+    try {
+      expect(getCapabilitiesForModel(provider, "vendor/claude-opus-4-8-fast")).toMatchObject({
+        thinkingFormat: "openai",
+        contextWindow: 300000,
+        maxOutput: 32000,
+      });
+    } finally {
+      delete PROVIDER_CAPABILITIES[provider];
     }
   });
 

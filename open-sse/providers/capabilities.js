@@ -2,9 +2,10 @@
 //
 // Fallback order (first match wins), result merged over DEFAULT_CAPABILITIES:
 //   1. PROVIDER_CAPABILITIES[provider][model]  — provider-specific override
-//   2. MODEL_CAPABILITIES[model]               — canonical exact id (handles exceptions)
-//   3. PATTERN_CAPABILITIES                     — glob match, ordered specific -> generic
-//   4. DEFAULT_CAPABILITIES                     — safe floor (always returned)
+//   2. Dynamic family resolvers                — versioned families and aliases
+//   3. MODEL_CAPABILITIES[model]               — canonical exact id (handles exceptions)
+//   4. PATTERN_CAPABILITIES                     — glob match, ordered specific -> generic
+//   5. DEFAULT_CAPABILITIES                     — safe floor (always returned)
 //
 // ── HOW TO ADD / UPDATE A MODEL ──────────────────────────────────────
 // Authoritative data source: https://models.dev/api.json (145 providers, 4000+
@@ -71,26 +72,6 @@ export function capabilitiesFromServiceKind(kind) {
  * otherwise mis-match. Only declare deltas vs DEFAULT.
  */
 export const MODEL_CAPABILITIES = {
-  // Claude Opus 5, 4.6/4.7/4.8, and Kiro Sonnet 5 have 1M context + adaptive thinking (override generic claude pattern)
-  "claude-opus-5":     { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-5-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-5-agentic": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-5-thinking-agentic": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4.6":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4.7":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4-7":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4.8":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4-6":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4-8":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4.8-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4-8-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-4.6": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-4-6": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-5": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-5-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-5-agentic": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-5-thinking-agentic": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-
   // Gemini image-gen / OpenAI image / xai image variants
   "gpt-image-1":       { imageOutput: true, tools: false },
 
@@ -109,6 +90,32 @@ export const MODEL_CAPABILITIES = {
   "kimi-k2.7-code":    { vision: true, videoInput: true, reasoning: true, thinkingFormat: "kimi", thinkingCanDisable: false, contextWindow: 262144, maxOutput: 65536 },
   "kimi-k2.7-code-highspeed": { vision: true, videoInput: true, reasoning: true, thinkingFormat: "kimi", thinkingCanDisable: false, contextWindow: 262144, maxOutput: 65536 },
 };
+
+const CLAUDE_ADAPTIVE_1M_CAPABILITIES = {
+  vision: true,
+  reasoning: true,
+  search: true,
+  thinkingFormat: "claude-adaptive",
+  contextWindow: 1000000,
+  maxOutput: 128000,
+};
+
+// Keep the version boundary strict so future families such as Opus 5.1 do not
+// inherit 5.0 capabilities before their limits are verified. Aliases may append
+// named transport variants or YYYY[-MM[-DD]] release dates.
+const CLAUDE_ALIAS_SUFFIX = String.raw`(?=$|[-_.:@](?:[a-z][a-z0-9]*|\d{4}(?:[-_.]?\d{2}){0,2})(?:$|[-_.:@]))`;
+const CLAUDE_ADAPTIVE_FAMILY_PATTERNS = [
+  new RegExp(String.raw`(?:^|[^a-z0-9])claude[-_.]+opus[-_.]+(?:4[.-](?:6|7|8)|5)${CLAUDE_ALIAS_SUFFIX}`, "i"),
+  new RegExp(String.raw`(?:^|[^a-z0-9])claude[-_.]+sonnet[-_.]+(?:4[.-](?:6|7)|5)${CLAUDE_ALIAS_SUFFIX}`, "i"),
+  new RegExp(String.raw`(?:^|[^a-z0-9])claude[-_.]+fable[-_.]+5${CLAUDE_ALIAS_SUFFIX}`, "i"),
+];
+
+function resolveClaudeAdaptiveFamily(model) {
+  if (typeof model !== "string") return null;
+  return CLAUDE_ADAPTIVE_FAMILY_PATTERNS.some((pattern) => pattern.test(model))
+    ? CLAUDE_ADAPTIVE_1M_CAPABILITIES
+    : null;
+}
 
 const KIRO_GPT_5_6_CAPABILITIES = { vision: true, reasoning: true, search: true, thinkingFormat: "openai", contextWindow: 272000, maxOutput: 128000 };
 
@@ -189,16 +196,9 @@ export const PROVIDER_CAPABILITIES = {
  */
 export const PATTERN_CAPABILITIES = [
   // ── Claude (4.6+ = adaptive thinking; older/haiku = budget) ──────
-  { pattern: "*claude*opus-5*",     caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
-  { pattern: "*claude*opus-4.6*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
-  { pattern: "*claude*opus-4.7*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
-  { pattern: "*claude*opus-4.8*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
-  { pattern: "*claude*sonnet-4.6*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
-  { pattern: "*claude*sonnet-4.7*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
   { pattern: "*claude*haiku*",  caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
   { pattern: "*claude*opus*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
   { pattern: "*claude*sonnet*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
-  { pattern: "*claude*fable*",  caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
   { pattern: "*claude*mythos*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget", contextWindow: 1000000, maxOutput: 128000 } },
   { pattern: "*claude-3*",      caps: { vision: true } },
   { pattern: "*claude*",        caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
@@ -317,7 +317,7 @@ export const PATTERN_CAPABILITIES = [
 ];
 
 /**
- * Resolve capabilities for a model using the 4-step fallback chain,
+ * Resolve capabilities for a model using the 5-step fallback chain,
  * merged over DEFAULT_CAPABILITIES so the result is always complete.
  *
  * @param {string} provider
@@ -337,17 +337,21 @@ export function getCapabilitiesForModel(provider, model) {
     if (providerCaps?.[baseModel]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[baseModel] };
   }
 
-  // 2. Canonical exact
+  // 2. Versioned model family
+  const familyCaps = resolveClaudeAdaptiveFamily(model) || resolveClaudeAdaptiveFamily(baseModel);
+  if (familyCaps) return { ...DEFAULT_CAPABILITIES, ...familyCaps };
+
+  // 3. Canonical exact
   if (MODEL_CAPABILITIES[baseModel]) return { ...DEFAULT_CAPABILITIES, ...MODEL_CAPABILITIES[baseModel] };
   if (MODEL_CAPABILITIES[model]) return { ...DEFAULT_CAPABILITIES, ...MODEL_CAPABILITIES[model] };
 
-  // 3. Pattern match (first match wins)
+  // 4. Pattern match (first match wins)
   for (const { pattern, caps } of PATTERN_CAPABILITIES) {
     if (matchPattern(pattern, baseModel) || matchPattern(pattern, model)) {
       return { ...DEFAULT_CAPABILITIES, ...caps };
     }
   }
 
-  // 4. Floor
+  // 5. Floor
   return { ...DEFAULT_CAPABILITIES };
 }
