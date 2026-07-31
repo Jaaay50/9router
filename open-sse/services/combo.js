@@ -225,9 +225,10 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
  * @param {Set<string>} [options.blockedProviders] - Provider exclusions shared by nested combos
+ * @param {Map<string|symbol, Promise>} [options.providerTails] - Per-provider queues shared by nested fusion combos
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, resolveModelProvider = null, blockedProviders = new Set() }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, resolveModelProvider = null, blockedProviders = new Set(), providerTails = null }) {
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -258,8 +259,25 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         continue;
       }
       log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
-      const blockedBefore = new Set(blockedProviders);
-      const result = await handleSingleModel(body, modelStr, blockedProviders);
+      let blockedBefore;
+      let result;
+      if (provider && providerTails) {
+        const previous = providerTails.get(provider) || Promise.resolve();
+        const call = previous.catch(() => {}).then(() => {
+          if (blockedProviders.has(provider)) return null;
+          blockedBefore = new Set(blockedProviders);
+          return handleSingleModel(body, modelStr, blockedProviders, providerTails);
+        });
+        providerTails.set(provider, call);
+        result = await call;
+        if (!result) {
+          log.info("COMBO", `Skipping model ${modelStr}: provider ${provider} rejected request schema`);
+          continue;
+        }
+      } else {
+        blockedBefore = new Set(blockedProviders);
+        result = await handleSingleModel(body, modelStr, blockedProviders, providerTails);
+      }
       
       // Success (2xx) - return response
       if (result.ok) {

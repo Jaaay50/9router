@@ -185,6 +185,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         comboStickyLimit,
         resolveModelProvider: async (candidate) => (await getModelInfo(candidate)).provider,
         ...(blockedProviders ? { blockedProviders } : {}),
+        ...(providerTails ? { providerTails } : {}),
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });

@@ -289,6 +289,54 @@ describe("Codex schema 400 account isolation", () => {
     expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
   });
 
+  it("shares provider queues from fusion into a nested fallback combo", async () => {
+    let activeCodexCalls = 0;
+    let maxActiveCodexCalls = 0;
+    mocks.getSettings.mockResolvedValue({
+      requireApiKey: false,
+      comboStrategies: { outerFusion: { fallbackStrategy: "fusion" } },
+    });
+    mocks.getComboModels.mockImplementation(async (model) => {
+      if (model === "outerFusion") return ["cx/gpt-5.6-sol", "innerFallback", "other/a"];
+      if (model === "innerFallback") return ["cx/gpt-5.6-codex", "other/b"];
+      return null;
+    });
+    mocks.getModelInfo.mockImplementation(async (model) => {
+      if (model === "outerFusion" || model === "innerFallback") return { provider: null, model };
+      const [prefix, resolvedModel] = model.split("/");
+      return { provider: prefix === "cx" ? "codex" : "other", model: resolvedModel };
+    });
+    mocks.handleChatCore.mockImplementation(async ({ modelInfo }) => {
+      if (modelInfo.provider === "codex") {
+        activeCodexCalls += 1;
+        maxActiveCodexCalls = Math.max(maxActiveCodexCalls, activeCodexCalls);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        activeCodexCalls -= 1;
+        return {
+          success: false,
+          status: 400,
+          error: SCHEMA_ERROR,
+          response: new Response("synthetic", { status: 400 }),
+          upstreamResponse: new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 }),
+        };
+      }
+      return {
+        success: true,
+        response: new Response(JSON.stringify({
+          output: [{ type: "message", content: [{ type: "output_text", text: `ok-${modelInfo.model}` }] }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } }),
+      };
+    });
+
+    const response = await handleChat(request({ model: "outerFusion" }));
+    const calledProviders = mocks.handleChatCore.mock.calls.map(([options]) => options.modelInfo.provider);
+
+    expect(response.ok).toBe(true);
+    expect(maxActiveCodexCalls).toBe(1);
+    expect(calledProviders.filter((provider) => provider === "codex")).toHaveLength(1);
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
   it("does not replay a stored lastError when all accounts were already locked", async () => {
     const retryAfter = new Date(Date.now() + 45000).toISOString();
     mocks.getProviderCredentials.mockResolvedValue({
