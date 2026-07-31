@@ -123,16 +123,22 @@ describe("model lock isolation", () => {
     expect(result.accessToken).toBe("TOKEN_account-a");
   });
 
-  it("does not write account state when the defensive marker receives a schema 400", async () => {
+  it.each([
+    ["item ID", {
+      type: "invalid_request_error",
+      code: "invalid_value",
+      param: "input[58].id",
+      message: "Expected an ID that begins with 'ctc' for input[58].id",
+    }],
+    ["top-level unsupported value", {
+      type: "invalid_request_error",
+      code: "unsupported_value",
+      param: "tool_choice",
+      message: "Unsupported value for 'tool_choice': 'BAD'.",
+    }],
+  ])("does not write account state when the defensive marker receives a %s schema 400", async (_name, payload) => {
     mocks.getProviderConnections.mockResolvedValue([connection("account-a")]);
-    const error = `[400]: ${JSON.stringify({
-      error: {
-        type: "invalid_request_error",
-        code: "invalid_value",
-        param: "input[434].id",
-        message: "Expected an ID that begins with 'ctc' for input[434].id",
-      },
-    })}`;
+    const error = `[400]: ${JSON.stringify({ error: payload })}`;
 
     const result = await markAccountUnavailable("account-a", 400, error, "codex", "gpt");
 

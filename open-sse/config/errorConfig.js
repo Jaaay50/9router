@@ -34,7 +34,21 @@ export const CODEX_REQUEST_SCHEMA_ERROR_CODES = new Set([
 ]);
 
 export const CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN = /\b(?:unknown[_ ]parameter|unsupported[_ ]value)\b/i;
-export const CODEX_REQUEST_SCHEMA_MESSAGE_ONLY_PATTERN = /(?:\bunknown[_ ]parameter\s*:\s*["'`]?[a-z_]\w*(?:\[\d+\])?(?:\.\w+)+|\bunsupported[_ ]value\s+(?:for|at)\s+["'`]?[a-z_]\w*(?:\[\d+\])?(?:\.\w+)+)/i;
+export const CODEX_REQUEST_SCHEMA_PARAM_ROOTS = new Set([
+  "input",
+  "instructions",
+  "tools",
+  "tool_choice",
+  "parallel_tool_calls",
+  "stream",
+  "store",
+  "reasoning",
+  "service_tier",
+  "include",
+  "prompt_cache_key",
+  "client_metadata",
+  "text",
+]);
 export const CODEX_ITEM_ID_PARAM_PATTERN = /^input\[\d+\]\.id$/;
 export const CODEX_ITEM_ID_MESSAGE_PATTERN = /expected an id that begins with ["'`]\w+["'`]/i;
 

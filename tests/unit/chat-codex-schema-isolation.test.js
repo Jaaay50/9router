@@ -50,13 +50,21 @@ vi.mock("@/sse/utils/logger.js", () => ({
 
 import { handleChat } from "../../src/sse/handlers/chat.js";
 
-const PROBE_ID = "item_probe_cross_request";
-const SCHEMA_ERROR = `[400]: ${JSON.stringify({
+const PROBE_ID = "item_8e297850f5942c40d91db6c2";
+const SCHEMA_ERROR = `[codex/gpt-5.6-sol] [400]: ${JSON.stringify({
   error: {
     type: "invalid_request_error",
     code: "invalid_value",
-    param: "input[434].id",
-    message: `Invalid 'input[434].id': '${PROBE_ID}'. Expected an ID that begins with 'ctc'.`,
+    param: "input[58].id",
+    message: `Invalid 'input[58].id': '${PROBE_ID}'. Expected an ID that begins with 'ctc'.`,
+  },
+})} (reset after 19s)`;
+const TOP_LEVEL_SCHEMA_ERROR = `[400]: ${JSON.stringify({
+  error: {
+    type: "invalid_request_error",
+    code: "unsupported_value",
+    param: "tool_choice",
+    message: "Unsupported value for 'tool_choice': 'BAD'.",
   },
 })}`;
 
@@ -117,6 +125,114 @@ describe("Codex schema 400 account isolation", () => {
     expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
     expect(mocks.clearAccountError).not.toHaveBeenCalled();
     expect(response.headers.get("Retry-After")).toBeNull();
+  });
+
+  it("does not rotate accounts or add cooldown for a top-level unsupported_value", async () => {
+    const originalResponse = new Response(JSON.stringify({ error: { message: TOP_LEVEL_SCHEMA_ERROR } }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+    mocks.getProviderCredentials
+      .mockReset()
+      .mockResolvedValueOnce(account("codex-account-1"))
+      .mockResolvedValueOnce(account("codex-account-2"));
+    mocks.handleChatCore.mockResolvedValue({
+      success: false,
+      status: 400,
+      error: TOP_LEVEL_SCHEMA_ERROR,
+      response: originalResponse,
+    });
+
+    const response = await handleChat(request({ tool_choice: "BAD" }));
+
+    expect(response).toBe(originalResponse);
+    expect(mocks.getProviderCredentials).toHaveBeenCalledTimes(1);
+    expect(mocks.handleChatCore).toHaveBeenCalledTimes(1);
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+    expect(mocks.clearAccountError).not.toHaveBeenCalled();
+    expect(response.headers.get("Retry-After")).toBeNull();
+  });
+
+  it("gives each account retry an independent request body", async () => {
+    const successResponse = new Response(JSON.stringify({ id: "resp_ok", output: [] }), { status: 200 });
+    mocks.getProviderCredentials
+      .mockReset()
+      .mockResolvedValueOnce(account("codex-account-1"))
+      .mockResolvedValueOnce(account("codex-account-2"));
+    mocks.markAccountUnavailable.mockResolvedValue({ shouldFallback: true, cooldownMs: 2000 });
+    mocks.handleChatCore
+      .mockReset()
+      .mockImplementationOnce(async ({ body }) => {
+        body.input[0].role = "mutated";
+        body.tools[0].function.name = "mutated";
+        body.injected = true;
+        return {
+          success: false,
+          status: 429,
+          error: "rate limit",
+          response: new Response("rate limit", { status: 429 }),
+        };
+      })
+      .mockImplementationOnce(async (options) => {
+        expect(options.body.input[0].role).toBe("system");
+        expect(options.body.tools[0].function.name).toBe("shell");
+        expect(options.body).not.toHaveProperty("injected");
+        await options.onRequestSuccess();
+        return { success: true, response: successResponse };
+      });
+
+    const response = await handleChat(request({
+      input: [{ type: "message", role: "system", content: "system prompt" }],
+      tools: [{ type: "function", function: { name: "shell", parameters: { type: "object" } } }],
+    }));
+
+    expect(response).toBe(successResponse);
+    expect(mocks.handleChatCore).toHaveBeenCalledTimes(2);
+    expect(mocks.markAccountUnavailable).toHaveBeenCalledTimes(1);
+    expect(mocks.clearAccountError).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives each heterogeneous Combo provider an independent request body", async () => {
+    const successResponse = new Response(JSON.stringify({ id: "resp_ok", output: [] }), { status: 200 });
+    mocks.getComboModels.mockResolvedValue(["cx/gpt-5.6-sol", "openai/gpt-5.5"]);
+    mocks.getModelInfo.mockImplementation(async (model) => ({
+      provider: model.startsWith("openai/") ? "openai" : "codex",
+      model: model.split("/")[1] || model,
+    }));
+    mocks.getProviderCredentials.mockImplementation(async (provider) => account(`${provider}-account-1`));
+    mocks.markAccountUnavailable.mockResolvedValue({ shouldFallback: false, cooldownMs: 2000 });
+    mocks.handleChatCore
+      .mockReset()
+      .mockImplementationOnce(async ({ body }) => {
+        body.input[0].content = "mutated";
+        body.tools[0].function.name = "mutated";
+        body.injected = true;
+        return {
+          success: false,
+          status: 429,
+          error: "rate limit",
+          response: new Response("rate limit", { status: 429 }),
+        };
+      })
+      .mockImplementationOnce(async (options) => {
+        expect(options.modelInfo.provider).toBe("openai");
+        expect(options.body.input[0].content).toBe("hello");
+        expect(options.body.tools[0].function.name).toBe("shell");
+        expect(options.body).not.toHaveProperty("injected");
+        await options.onRequestSuccess();
+        return { success: true, response: successResponse };
+      });
+
+    const response = await handleChat(request({
+      model: "company-combo",
+      input: [{ type: "message", role: "user", content: "hello" }],
+      tools: [{ type: "function", function: { name: "shell", parameters: { type: "object" } } }],
+    }));
+
+    expect(response).toBe(successResponse);
+    expect(mocks.handleChatCore).toHaveBeenCalledTimes(2);
+    expect(mocks.markAccountUnavailable).toHaveBeenCalledTimes(1);
+    expect(mocks.clearAccountError).toHaveBeenCalledTimes(1);
   });
 
   it("does not carry a failed request's probe ID into the next valid request", async () => {

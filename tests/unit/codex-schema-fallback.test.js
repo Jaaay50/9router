@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { classifyProviderError, isCodexRequestSchemaError } from "../../open-sse/services/accountFallback.js";
 import { handleComboChat } from "../../open-sse/services/combo.js";
+import { createErrorResult } from "../../open-sse/utils/error.js";
 
 const ITEM_ID_ERROR = {
   type: "invalid_request_error",
@@ -9,6 +10,16 @@ const ITEM_ID_ERROR = {
   param: "input[434].id",
   message: "Invalid 'input[434].id': 'item_probe_434'. Expected an ID that begins with 'ctc'.",
 };
+
+const SCREENSHOT_ITEM_ID_ERROR = {
+  type: "invalid_request_error",
+  code: "invalid_value",
+  param: "input[58].id",
+  message: "Invalid 'input[58].id': 'item_8e297850f5942c40d91db6c2'. Expected an ID that begins with 'ctc'.",
+};
+const SCREENSHOT_WRAPPED_ERROR = `[codex/gpt-5.6-sol] [400]: ${JSON.stringify({
+  error: SCREENSHOT_ITEM_ID_ERROR,
+})} (reset after 19s)`;
 
 const log = { info: vi.fn(), warn: vi.fn() };
 
@@ -42,17 +53,42 @@ describe("Codex request schema classification", () => {
 
   it.each([
     ["structured error", { error: ITEM_ID_ERROR }],
+    ["screenshot input[58] error", { error: SCREENSHOT_ITEM_ID_ERROR }],
+    ["full screenshot wrapper with stale reset suffix", SCREENSHOT_WRAPPED_ERROR],
     ["raw JSON", JSON.stringify({ error: ITEM_ID_ERROR })],
     ["status wrapped JSON", `[400]: ${JSON.stringify({ error: ITEM_ID_ERROR })}`],
     ["outer response wrapper", { error: { message: `[400]: ${JSON.stringify({ error: ITEM_ID_ERROR })}`, type: "invalid_request_error", code: "bad_request" } }],
     ["message-only item error", `[400]: ${ITEM_ID_ERROR.message}`],
     ["unknown_parameter", { error: { type: "invalid_request_error", code: "unknown_parameter", message: "Unknown parameter: 'input[2].namespace'." } }],
     ["top-level unknown_parameter", { error: { type: "invalid_request_error", code: "unknown_parameter", param: "parallel_tool_calls", message: "Unknown parameter: 'parallel_tool_calls'." } }],
+    ["structured unknown_parameter alternate wording", { error: { type: "invalid_request_error", code: "unknown_parameter", param: "stream", message: "This request option is not recognized." } }],
     ["unsupported_value", { error: { type: "invalid_request_error", code: "unsupported_value", message: "Unsupported value for 'input[2].type'." } }],
+    ["top-level tool_choice unsupported_value", { error: { type: "invalid_request_error", code: "unsupported_value", param: "tool_choice", message: "Unsupported value for 'tool_choice': 'BAD'." } }],
+    ["top-level service_tier unsupported_value", { error: { type: "invalid_request_error", code: "unsupported_value", param: "service_tier", message: "Unsupported value for 'service_tier': 'BAD'." } }],
+    ["top-level prompt_cache_key unsupported_value", { error: { type: "invalid_request_error", code: "unsupported_value", param: "prompt_cache_key", message: "Unsupported value for 'prompt_cache_key': 'BAD'." } }],
+    ["top-level client_metadata unsupported_value", { error: { type: "invalid_request_error", code: "unsupported_value", param: "client_metadata", message: "Unsupported value for 'client_metadata': 'BAD'." } }],
+    ["structured unsupported_value alternate wording", { error: { type: "invalid_request_error", code: "unsupported_value", param: "client_metadata", message: "This request option is invalid." } }],
     ["message-only unknown_parameter", "[400]: Unknown parameter: 'input[150].namespace'."],
     ["message-only unsupported_value", "[400]: Unsupported value for 'input[2].type'."],
+    ["message-only top-level unsupported_value", "[400]: Unsupported value for 'tool_choice': 'BAD'."],
   ])("classifies %s as a provider-scoped request schema error", (_name, value) => {
     expect(classifyProviderError("codex", 400, value)).toEqual({
+      category: "request_schema",
+      accountFallback: false,
+      cooldownMs: 0,
+      comboScope: "provider",
+    });
+  });
+
+  it("classifies the real createErrorResult wrapper used by chatCore", () => {
+    const result = createErrorResult(400, `[400]: ${JSON.stringify({ error: {
+      type: "invalid_request_error",
+      code: "unsupported_value",
+      param: "tool_choice",
+      message: "Unsupported value for 'tool_choice': 'BAD'.",
+    } })}`);
+
+    expect(classifyProviderError("codex", result.status, result.error)).toEqual({
       category: "request_schema",
       accountFallback: false,
       cooldownMs: 0,
@@ -75,6 +111,8 @@ describe("Codex request schema classification", () => {
     ["message-only unsupported account value", "codex", 400, "Unsupported value for the current account"],
     ["unsupported account model", "codex", 400, "The model is not supported when using Codex with a ChatGPT account."],
     ["structured unsupported account model", "codex", 400, { error: { type: "invalid_request_error", code: "unsupported_value", param: "model", message: "Unsupported value for model: this model is not supported when using Codex with a ChatGPT account." } }],
+    ["generic model unsupported_value", "codex", 400, { error: { type: "invalid_request_error", code: "unsupported_value", param: "model", message: "Unsupported value for 'model': 'BAD'." } }],
+    ["account model unknown_parameter", "codex", 400, { error: { type: "invalid_request_error", code: "unknown_parameter", param: "model", message: "Unknown parameter: 'model'. This model is not supported for the current account." } }],
     ["unrelated invalid_value", "codex", 400, { error: { type: "invalid_request_error", code: "invalid_value", param: "reasoning.effort", message: "Invalid value: xhigh" } }],
     ["non-ID prefix message", "codex", 400, { error: { type: "invalid_request_error", code: "invalid_value", param: "input[4].id", message: "Invalid item ID" } }],
   ])("does not classify %s", (_name, provider, status, value) => {
@@ -130,6 +168,27 @@ describe("Codex request schema classification", () => {
     });
 
     expect(response).toBe(firstResponse);
+    expect(handleSingleModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps createErrorResult schema errors provider-scoped in an all-Codex combo", async () => {
+    const firstResult = createErrorResult(400, `[400]: ${JSON.stringify({ error: {
+      type: "invalid_request_error",
+      code: "unsupported_value",
+      param: "service_tier",
+      message: "Unsupported value for 'service_tier': 'BAD'.",
+    } })}`);
+    const handleSingleModel = vi.fn().mockResolvedValue(firstResult.response);
+
+    const response = await handleComboChat({
+      body: {},
+      models: ["cx/gpt-5.6-sol", "codex/gpt-5.5"],
+      handleSingleModel,
+      log,
+      autoSwitch: false,
+    });
+
+    expect(response).toBe(firstResult.response);
     expect(handleSingleModel).toHaveBeenCalledTimes(1);
   });
 

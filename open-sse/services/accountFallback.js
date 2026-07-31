@@ -4,7 +4,7 @@ import {
   TRANSIENT_COOLDOWN_MS,
   CODEX_REQUEST_SCHEMA_ERROR_CODES,
   CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN,
-  CODEX_REQUEST_SCHEMA_MESSAGE_ONLY_PATTERN,
+  CODEX_REQUEST_SCHEMA_PARAM_ROOTS,
   CODEX_ITEM_ID_PARAM_PATTERN,
   CODEX_ITEM_ID_MESSAGE_PATTERN,
   REQUEST_SCHEMA_CLASSIFICATION,
@@ -63,6 +63,15 @@ function normalizeErrorPayload(value, depth = 0) {
   return value;
 }
 
+function getSchemaParamRoot(param, message) {
+  const direct = String(param || "").match(/^([a-z_]\w*)/i)?.[1];
+  if (direct) return direct.toLowerCase();
+  const embedded = String(message || "").match(
+    /\b(?:unknown[_ ]parameter\s*:\s*|unsupported[_ ]value\s+(?:for|at)\s+)["'`]?([a-z_]\w*)/i
+  )?.[1];
+  return embedded?.toLowerCase() || null;
+}
+
 export function isCodexRequestSchemaError(provider, status, errorValue = "") {
   if (provider !== "codex" || Number(status) !== 400) return false;
 
@@ -84,11 +93,10 @@ export function isCodexRequestSchemaError(provider, status, errorValue = "") {
     ? code
     : (CODEX_REQUEST_SCHEMA_ERROR_CODES.has(type) ? type : null);
   const metadataAllowsMessageOnly = !code && (!type || type === "invalid_request_error");
-  const schemaField = /^(?:input|tools)(?:\[\d+\])?(?:\.|\[)|^(?:tool_choice|reasoning|text|include|instructions)\./i.test(param)
-    || CODEX_REQUEST_SCHEMA_MESSAGE_ONLY_PATTERN.test(message);
-  if (schemaCode === "unknown_parameter") return CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN.test(message);
-  if (schemaCode === "unsupported_value") return schemaField && CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN.test(message);
-  return metadataAllowsMessageOnly && CODEX_REQUEST_SCHEMA_MESSAGE_ONLY_PATTERN.test(message);
+  const schemaField = CODEX_REQUEST_SCHEMA_PARAM_ROOTS.has(getSchemaParamRoot(param, message));
+  if (schemaCode === "unknown_parameter") return schemaField;
+  if (schemaCode === "unsupported_value") return schemaField;
+  return metadataAllowsMessageOnly && schemaField && CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN.test(message);
 }
 
 export function classifyProviderError(provider, status, errorText, backoffLevel = 0) {

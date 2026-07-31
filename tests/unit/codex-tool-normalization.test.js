@@ -11,12 +11,12 @@ function normalizeTools(tools) {
     stream: true,
   };
 
-  executor.transformRequest("gpt-5.5", body, true, {
+  const transformed = executor.transformRequest("gpt-5.5", body, true, {
     connectionId: "test-codex-tools",
     providerSpecificData: {},
   });
 
-  return body.tools;
+  return transformed.tools;
 }
 
 describe("CodexExecutor tool normalization", () => {
@@ -45,12 +45,13 @@ describe("CodexExecutor tool normalization", () => {
       },
     };
 
-    executor.transformRequest("gpt-5.4-mini", body, true, {
+    const sourceSnapshot = structuredClone(body);
+    const transformed = executor.transformRequest("gpt-5.4-mini", body, true, {
       connectionId: "test-codex-structured-output",
       providerSpecificData: {},
     });
 
-    expect(body.text).toEqual({
+    expect(transformed.text).toEqual({
       format: {
         type: "json_schema",
         name: "codex_output_schema",
@@ -58,7 +59,8 @@ describe("CodexExecutor tool normalization", () => {
         schema,
       },
     });
-    expect(body.metadata).toBeUndefined();
+    expect(transformed.metadata).toBeUndefined();
+    expect(body).toEqual(sourceSnapshot);
   });
 
   it("preserves Responses-native tool_search tools", () => {
