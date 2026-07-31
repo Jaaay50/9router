@@ -28,6 +28,23 @@ export const DEFAULT_ERROR_MESSAGES = {
   504: "Gateway timeout"
 };
 
+export const CODEX_REQUEST_SCHEMA_ERROR_CODES = new Set([
+  "unknown_parameter",
+  "unsupported_value",
+]);
+
+export const CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN = /\b(?:unknown[_ ]parameter|unsupported[_ ]value)\b/i;
+export const CODEX_REQUEST_SCHEMA_MESSAGE_ONLY_PATTERN = /(?:\bunknown[_ ]parameter\s*:\s*["'`]?[a-z_]\w*(?:\[\d+\])?(?:\.\w+)+|\bunsupported[_ ]value\s+(?:for|at)\s+["'`]?[a-z_]\w*(?:\[\d+\])?(?:\.\w+)+)/i;
+export const CODEX_ITEM_ID_PARAM_PATTERN = /^input\[\d+\]\.id$/;
+export const CODEX_ITEM_ID_MESSAGE_PATTERN = /expected an id that begins with ["'`]\w+["'`]/i;
+
+export const REQUEST_SCHEMA_CLASSIFICATION = Object.freeze({
+  category: "request_schema",
+  accountFallback: false,
+  cooldownMs: 0,
+  comboScope: "provider",
+});
+
 // Exponential backoff config for rate limits
 export const BACKOFF_CONFIG = {
   base: 2000,

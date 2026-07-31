@@ -1,4 +1,5 @@
 import "open-sse/index.js";
+import { classifyProviderError } from "open-sse/services/accountFallback.js";
 
 import {
   getProviderCredentials,
@@ -123,7 +124,8 @@ export async function handleChat(request, clientRawRequest = null) {
       log,
       comboName: modelStr,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      resolveModelProvider: async (comboModel) => (await getModelInfo(comboModel)).provider,
     });
   }
 
@@ -176,7 +178,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         log,
         comboName: modelStr,
         comboStrategy,
-        comboStickyLimit
+        comboStickyLimit,
+        resolveModelProvider: async (comboModel) => (await getModelInfo(comboModel)).provider,
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
@@ -201,8 +204,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
-        const errorMsg = lastError || credentials.lastError || "Unavailable";
-        const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
+        const errorMsg = lastError || "Temporarily unavailable";
+        const status = lastError ? (lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE) : HTTP_STATUS.SERVICE_UNAVAILABLE;
         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
         return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman);
       }
@@ -270,6 +273,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     });
 
     if (result.success) return result.response;
+
+    const classification = classifyProviderError(provider, result.status, result.error);
+    if (classification.category === "request_schema") {
+      log.warn("REQUEST", `Non-retryable Codex request schema error (${result.status})`);
+      return result.response;
+    }
 
     // Mark account unavailable (auto-calculates cooldown with exponential backoff, or precise resetsAtMs)
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, result.resetsAtMs);

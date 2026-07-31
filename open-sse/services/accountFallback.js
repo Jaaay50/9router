@@ -1,4 +1,110 @@
-import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
+import {
+  ERROR_RULES,
+  BACKOFF_CONFIG,
+  TRANSIENT_COOLDOWN_MS,
+  CODEX_REQUEST_SCHEMA_ERROR_CODES,
+  CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN,
+  CODEX_REQUEST_SCHEMA_MESSAGE_ONLY_PATTERN,
+  CODEX_ITEM_ID_PARAM_PATTERN,
+  CODEX_ITEM_ID_MESSAGE_PATTERN,
+  REQUEST_SCHEMA_CLASSIFICATION,
+} from "../config/errorConfig.js";
+
+function parseJsonErrorText(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim().replace(/^\[\d+\]:\s*/, "");
+  const candidates = [text];
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) candidates.push(text.slice(firstBrace, lastBrace + 1));
+  for (const candidate of candidates) {
+    try { return JSON.parse(candidate); } catch { /* try the next shape */ }
+  }
+  return null;
+}
+
+function hasErrorMetadata(value) {
+  return Boolean(value?.type || value?.code || value?.param);
+}
+
+function isGenericBadRequestWrapper(value) {
+  return String(value?.type || "").toLowerCase() === "invalid_request_error"
+    && String(value?.code || "").toLowerCase() === "bad_request"
+    && typeof value?.message === "string";
+}
+
+function normalizeErrorPayload(value, depth = 0) {
+  if (depth > 6) return { message: "" };
+  if (typeof value === "string") {
+    const parsed = parseJsonErrorText(value);
+    return parsed ? normalizeErrorPayload(parsed, depth + 1) : { message: value };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { message: String(value || "") };
+  }
+
+  if (hasErrorMetadata(value) && !isGenericBadRequestWrapper(value)) return value;
+  if (isGenericBadRequestWrapper(value)) {
+    const parsed = parseJsonErrorText(value.message);
+    return parsed
+      ? normalizeErrorPayload(parsed, depth + 1)
+      : { message: value.message };
+  }
+  if (value.error && typeof value.error === "object" && !Array.isArray(value.error)) {
+    return normalizeErrorPayload(value.error, depth + 1);
+  }
+  if (typeof value.error === "string") {
+    return normalizeErrorPayload(value.error, depth + 1);
+  }
+  if (typeof value.message === "string") {
+    const parsed = parseJsonErrorText(value.message);
+    if (parsed) return normalizeErrorPayload(parsed, depth + 1);
+  }
+  return value;
+}
+
+export function isCodexRequestSchemaError(provider, status, errorValue = "") {
+  if (provider !== "codex" || Number(status) !== 400) return false;
+
+  const error = normalizeErrorPayload(errorValue);
+  const type = String(error?.type || "").toLowerCase();
+  const code = String(error?.code || "").toLowerCase();
+  const param = String(error?.param || "");
+  const message = String(error?.message || (typeof error?.error === "string" ? error.error : ""));
+
+  if (code === "invalid_prompt" || type === "invalid_prompt") return false;
+
+  const itemIdParam = CODEX_ITEM_ID_PARAM_PATTERN.test(param)
+    || /input\[\d+\]\.id/i.test(message);
+  const itemIdMetadata = (!type || type === "invalid_request_error")
+    && (!code || code === "invalid_value");
+  if (itemIdMetadata && itemIdParam && CODEX_ITEM_ID_MESSAGE_PATTERN.test(message)) return true;
+
+  const schemaCode = CODEX_REQUEST_SCHEMA_ERROR_CODES.has(code)
+    ? code
+    : (CODEX_REQUEST_SCHEMA_ERROR_CODES.has(type) ? type : null);
+  const metadataAllowsMessageOnly = !code && (!type || type === "invalid_request_error");
+  const schemaField = /^(?:input|tools)(?:\[\d+\])?(?:\.|\[)|^(?:tool_choice|reasoning|text|include|instructions)\./i.test(param)
+    || CODEX_REQUEST_SCHEMA_MESSAGE_ONLY_PATTERN.test(message);
+  if (schemaCode === "unknown_parameter") return CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN.test(message);
+  if (schemaCode === "unsupported_value") return schemaField && CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN.test(message);
+  return metadataAllowsMessageOnly && CODEX_REQUEST_SCHEMA_MESSAGE_ONLY_PATTERN.test(message);
+}
+
+export function classifyProviderError(provider, status, errorText, backoffLevel = 0) {
+  if (isCodexRequestSchemaError(provider, status, errorText)) {
+    return { ...REQUEST_SCHEMA_CLASSIFICATION };
+  }
+
+  const { shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel);
+  return {
+    category: "provider_error",
+    accountFallback: shouldFallback,
+    cooldownMs,
+    comboScope: "model",
+    ...(newBackoffLevel === undefined ? {} : { newBackoffLevel }),
+  };
+}
 
 /**
  * Calculate exponential backoff cooldown for rate limits (429)
@@ -118,10 +224,26 @@ export function getModelLockKey(model) {
  * Reads flat field `modelLock_${model}` (or `modelLock___all` when model=null).
  */
 export function isModelLockActive(connection, model) {
-  const key = getModelLockKey(model);
-  const expiry = connection[key] || connection[MODEL_LOCK_ALL];
-  if (!expiry) return false;
-  return new Date(expiry).getTime() > Date.now();
+  return Boolean(getModelLockUntil(connection, model));
+}
+
+/**
+ * Get when a connection becomes usable for the requested model.
+ * The account is blocked until both its model-specific and account-wide locks expire.
+ */
+export function getModelLockUntil(connection, model) {
+  if (!connection) return null;
+  const keys = model
+    ? [...new Set([getModelLockKey(model), MODEL_LOCK_ALL])]
+    : [MODEL_LOCK_ALL];
+  const now = Date.now();
+  let unlockAt = null;
+  for (const key of keys) {
+    const time = new Date(connection[key]).getTime();
+    if (!Number.isFinite(time) || time <= now) continue;
+    if (!unlockAt || time > unlockAt) unlockAt = time;
+  }
+  return unlockAt ? new Date(unlockAt).toISOString() : null;
 }
 
 /**

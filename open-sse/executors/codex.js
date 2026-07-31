@@ -24,8 +24,14 @@ const CODEX_SSE_USER_OUTPUT_PATTERNS = [
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
 const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
 
-// Server-generated item id prefixes that Codex /responses cannot resolve when store=false
-const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
+// Bare server-side references cannot be resolved when Codex requests use store=false.
+const STORED_ITEM_REFERENCE_PATTERN = /^(rs|fc|ctc|resp|msg)_/;
+const STATELESS_ITEM_ID_TYPES = new Set([
+  "function_call",
+  "function_call_output",
+  "custom_tool_call",
+  "custom_tool_call_output",
+]);
 
 // Hosted tool types that Codex/OpenAI Responses executes server-side
 const CODEX_HOSTED_TOOL_TYPES = new Set([
@@ -54,19 +60,24 @@ function convertSystemToDeveloperRole(body) {
   }
 }
 
-// Strip invalid or stored item IDs before sending a store=false request.
-function stripStoredItemReferences(body) {
-  if (!Array.isArray(body.input)) return;
-  body.input = body.input.filter((item) => {
-    if (typeof item === "string" && SERVER_ID_PATTERN.test(item)) return false;
-    if (item && typeof item === "object" && !Array.isArray(item)) {
-      if (item.type === "item_reference") return false;
-      // function_call.id is optional input metadata; call_id carries tool-result correlation.
-      if (item.type === "function_call") delete item.id;
-      if (typeof item.id === "string" && SERVER_ID_PATTERN.test(item.id)) delete item.id;
-    }
-    return true;
+// Normalize stateless input without mutating replay items shared with another combo provider.
+function normalizeStatelessInput(body) {
+  const strippedIds = {};
+  if (!Array.isArray(body.input)) return strippedIds;
+
+  body.input = body.input.flatMap((item) => {
+    if (typeof item === "string" && STORED_ITEM_REFERENCE_PATTERN.test(item)) return [];
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [item];
+    if (item.type === "item_reference") return [];
+    if (!STATELESS_ITEM_ID_TYPES.has(item.type) || !Object.hasOwn(item, "id")) return [item];
+
+    const normalizedItem = { ...item };
+    delete normalizedItem.id;
+    strippedIds[item.type] = (strippedIds[item.type] || 0) + 1;
+    return [normalizedItem];
   });
+
+  return strippedIds;
 }
 
 // Flatten Chat-Completions tool shape into Responses flat format + filter unsupported tools
@@ -403,8 +414,12 @@ export class CodexExecutor extends BaseExecutor {
 
     // Keep system prompts in body.input as role=developer so they stay in the cacheable prefix
     convertSystemToDeveloperRole(body);
-    // Strip invalid function-call IDs and stored references that Codex cannot resolve with store=false
-    stripStoredItemReferences(body);
+    // Strip optional tool item IDs and stored references that store=false cannot resolve.
+    const strippedIds = normalizeStatelessInput(body);
+    if (Object.keys(strippedIds).length > 0) {
+      const counts = Object.entries(strippedIds).map(([type, count]) => `${type}=${count}`).join(" ");
+      dbg("CODEX", `normalized stateless item ids | ${counts}`);
+    }
     // Flatten function tools + drop unsupported types
     normalizeCodexTools(body);
 
