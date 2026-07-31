@@ -224,9 +224,10 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {string} [options.comboName] - Name of the combo (for round-robin tracking)
  * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
+ * @param {Set<string>} [options.blockedProviders] - Provider exclusions shared by nested combos
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, resolveModelProvider = null }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, resolveModelProvider = null, blockedProviders = new Set() }) {
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -246,7 +247,6 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   let earliestRetryAfter = null;
   let lastStatus = null;
   let requestSchemaResponse = null;
-  const blockedProviders = new Set();
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
@@ -258,7 +258,8 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         continue;
       }
       log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
-      const result = await handleSingleModel(body, modelStr);
+      const blockedBefore = new Set(blockedProviders);
+      const result = await handleSingleModel(body, modelStr, blockedProviders);
       
       // Success (2xx) - return response
       if (result.ok) {
@@ -289,11 +290,13 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         try { errorText = JSON.stringify(errorText); } catch { errorText = String(errorText); }
       }
 
-      const classification = classifyProviderError(provider, result.status, errorPayload || errorText);
+      const nestedSchemaProvider = provider ? null : [...blockedProviders].find((item) => !blockedBefore.has(item));
+      const errorProvider = provider || nestedSchemaProvider;
+      const classification = classifyProviderError(errorProvider, result.status, errorPayload || errorText);
       if (classification.comboScope === "provider") {
         if (!requestSchemaResponse) requestSchemaResponse = result;
-        if (provider) blockedProviders.add(provider);
-        log.warn("COMBO", `Provider ${provider || "unknown"} rejected the request schema`, { status: result.status });
+        if (errorProvider) blockedProviders.add(errorProvider);
+        log.warn("COMBO", `Provider ${errorProvider || "unknown"} rejected the request schema`, { status: result.status });
         continue;
       }
 

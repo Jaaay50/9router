@@ -100,6 +100,30 @@ describe("Codex schema 400 account isolation", () => {
     expect(response.headers.get("Retry-After")).toBeNull();
   });
 
+  it("does not leak a schema error into the next valid request", async () => {
+    const schemaResponse = new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 });
+    const successResponse = new Response(JSON.stringify({ id: "resp_valid", output: [] }), { status: 200 });
+    mocks.handleChatCore
+      .mockResolvedValueOnce({
+        success: false,
+        status: 400,
+        error: SCHEMA_ERROR,
+        response: new Response("synthetic", { status: 400 }),
+        upstreamResponse: schemaResponse,
+      })
+      .mockResolvedValueOnce({ success: true, response: successResponse });
+
+    const firstResponse = await handleChat(request());
+    const secondResponse = await handleChat(request({ input: [{ type: "message", role: "user", content: "valid" }] }));
+    const secondBody = await secondResponse.text();
+
+    expect(firstResponse).toBe(schemaResponse);
+    expect(secondResponse).toBe(successResponse);
+    expect(secondBody).not.toContain(PROBE_ID);
+    expect(mocks.handleChatCore).toHaveBeenCalledTimes(2);
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
   it("keeps 429 account fallback unchanged", async () => {
     const success = new Response("ok", { status: 200 });
     mocks.getProviderCredentials
@@ -115,6 +139,33 @@ describe("Codex schema 400 account isolation", () => {
     expect(response).toBe(success);
     expect(mocks.getProviderCredentials).toHaveBeenCalledTimes(2);
     expect(mocks.markAccountUnavailable).toHaveBeenCalledOnce();
+  });
+
+  it("does not retry Codex through a nested combo", async () => {
+    const schemaResponse = new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 });
+    mocks.getComboModels.mockImplementation(async (model) => {
+      if (model === "outer") return ["inner", "cx/gpt-5.6-sol"];
+      if (model === "inner") return ["cx/gpt-5.6-sol", "cx/gpt-5.6-codex"];
+      return null;
+    });
+    mocks.getModelInfo.mockImplementation(async (model) => {
+      if (model === "outer" || model === "inner") return { provider: null, model };
+      return { provider: "codex", model: model.split("/").at(-1) };
+    });
+    mocks.handleChatCore.mockResolvedValue({
+      success: false,
+      status: 400,
+      error: SCHEMA_ERROR,
+      response: new Response("synthetic", { status: 400 }),
+      upstreamResponse: schemaResponse,
+    });
+
+    const response = await handleChat(request({ model: "outer" }));
+
+    expect(response).toBe(schemaResponse);
+    expect(mocks.handleChatCore).toHaveBeenCalledOnce();
+    expect(mocks.getProviderCredentials).toHaveBeenCalledOnce();
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
   });
 
   it("does not replay a stored lastError when all accounts were already locked", async () => {

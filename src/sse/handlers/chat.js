@@ -120,7 +120,7 @@ export async function handleChat(request, clientRawRequest = null) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+      handleSingleModel: (b, m, blockedProviders) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, blockedProviders),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -136,7 +136,7 @@ export async function handleChat(request, clientRawRequest = null) {
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, blockedProviders = null) {
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
@@ -174,12 +174,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return handleComboChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        handleSingleModel: (b, m, sharedBlockedProviders) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, sharedBlockedProviders),
         log,
         comboName: modelStr,
         comboStrategy,
         comboStickyLimit,
         resolveModelProvider: async (candidate) => (await getModelInfo(candidate)).provider,
+        ...(blockedProviders ? { blockedProviders } : {}),
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
@@ -276,8 +277,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     const classification = classifyProviderError(provider, result.status, result.error);
     if (classification.category === "request_schema") {
+      blockedProviders?.add(provider);
       log.warn("REQUEST", `Non-retryable Codex request schema error (${result.status})`, { provider });
-      return result.response;
+      return result.upstreamResponse || result.response;
     }
 
     // Mark account unavailable (auto-calculates cooldown with exponential backoff, or precise resetsAtMs)
