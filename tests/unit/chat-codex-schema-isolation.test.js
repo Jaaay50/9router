@@ -117,4 +117,23 @@ describe("Codex schema 400 account isolation", () => {
     expect(mocks.markAccountUnavailable).toHaveBeenCalledOnce();
   });
 
+  it("does not replay a stored lastError when all accounts were already locked", async () => {
+    const retryAfter = new Date(Date.now() + 45000).toISOString();
+    mocks.getProviderCredentials.mockResolvedValue({
+      allRateLimited: true,
+      retryAfter,
+      retryAfterHuman: "reset after 45s",
+      lastError: `old ${PROBE_ID}`,
+      lastErrorCode: 400,
+    });
+
+    const response = await handleChat(request());
+    const text = await response.text();
+
+    expect(response.status).toBe(503);
+    expect(text).toContain("Temporarily unavailable");
+    expect(text).not.toContain(PROBE_ID);
+    expect(mocks.handleChatCore).not.toHaveBeenCalled();
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
 });

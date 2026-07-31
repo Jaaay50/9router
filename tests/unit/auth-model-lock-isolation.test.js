@@ -29,7 +29,8 @@ vi.mock("@/shared/constants/providers.js", () => ({
 }));
 vi.mock("@/sse/utils/logger.js", () => ({ info: vi.fn(), debug: vi.fn(), warn: vi.fn() }));
 
-import { markAccountUnavailable } from "../../src/sse/services/auth.js";
+import { getProviderCredentials, markAccountUnavailable } from "../../src/sse/services/auth.js";
+import { getModelLockUntil, isModelLockActive } from "../../open-sse/services/accountFallback.js";
 
 const NOW = new Date("2026-07-31T03:00:00.000Z");
 const at = seconds => new Date(NOW.getTime() + seconds * 1000).toISOString();
@@ -46,7 +47,7 @@ function connection(id, fields = {}) {
   };
 }
 
-describe("account fallback isolation", () => {
+describe("model lock isolation", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
@@ -56,6 +57,50 @@ describe("account fallback isolation", () => {
   });
 
   afterEach(() => vi.useRealTimers());
+
+  it("uses only the requested model and global locks for retry timing", async () => {
+    const connections = [
+      connection("account-a", {
+        modelLock_gpt: at(60),
+        modelLock___all: at(120),
+        modelLock_other: at(10),
+        lastError: "old item_probe_a",
+      }),
+      connection("account-b", {
+        modelLock_gpt: at(90),
+        modelLock_other: at(300),
+        lastError: "old item_probe_b",
+      }),
+    ];
+    mocks.getProviderConnections.mockResolvedValue(connections);
+
+    expect(getModelLockUntil(connections[0], "gpt")).toBe(at(120));
+    expect(getModelLockUntil(connections[1], "gpt")).toBe(at(90));
+
+    const result = await getProviderCredentials("codex", null, "gpt");
+    expect(result).toEqual({
+      allRateLimited: true,
+      retryAfter: at(90),
+      retryAfterHuman: "reset after 1m 30s",
+    });
+  });
+
+  it("does not let an expired model lock hide an active global lock", () => {
+    const account = connection("account-a", {
+      modelLock_gpt: at(-10),
+      modelLock___all: at(30),
+    });
+    expect(isModelLockActive(account, "gpt")).toBe(true);
+    expect(getModelLockUntil(account, "gpt")).toBe(at(30));
+  });
+
+  it("ignores another model's lock", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      connection("account-a", { modelLock_other: at(300), lastError: "old item_probe_other" }),
+    ]);
+    const result = await getProviderCredentials("codex", null, "gpt");
+    expect(result.connectionId).toBe("account-a");
+  });
 
   it("rejects schema errors before DB reads even with a future reset timestamp", async () => {
     const error = `[400]: ${JSON.stringify({ error: {
