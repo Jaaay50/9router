@@ -26,6 +26,12 @@ function schemaResponse() {
   } }), { status: 400, headers: { "Content-Type": "application/json" } });
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe("fusion combo", () => {
   it("answers directly with a single-model panel (nothing to fuse)", async () => {
     const handleSingleModel = vi.fn(async () => okResponse("solo"));
@@ -119,6 +125,214 @@ describe("fusion combo", () => {
     expect(judgeText).toContain("fast-p/x");
     expect(judgeText).toContain("fast-p/y");
     expect(judgeText).not.toContain("slow");
+  });
+
+  it("uses a non-busy provider for judging after quorum leaves a provider straggler", async () => {
+    const slowGate = deferred();
+    const slowDone = deferred();
+    const activeByProvider = new Map();
+    const maxActiveByProvider = new Map();
+    const handleSingleModel = vi.fn(async (_body, model, isPanel) => {
+      const provider = model.split("/")[0];
+      const active = (activeByProvider.get(provider) || 0) + 1;
+      activeByProvider.set(provider, active);
+      maxActiveByProvider.set(provider, Math.max(maxActiveByProvider.get(provider) || 0, active));
+      try {
+        if (model === "p/slow") {
+          await slowGate.promise;
+          slowDone.resolve();
+          return okResponse("slow");
+        }
+        if (!isPanel) return okResponse("FINAL");
+        return okResponse(`fast-${model}`);
+      } finally {
+        activeByProvider.set(provider, activeByProvider.get(provider) - 1);
+      }
+    });
+
+    const fusion = handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["p/fast", "q/fast", "p/slow"],
+      handleSingleModel,
+      log,
+      resolveModelProvider: async (model) => model.split("/")[0],
+      tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+    });
+    let raced;
+    try {
+      raced = await Promise.race([
+        fusion.then((response) => ({ response })),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 250)),
+      ]);
+    } finally {
+      slowGate.resolve();
+    }
+    const response = await fusion;
+    await slowDone.promise;
+
+    expect(raced.timedOut).not.toBe(true);
+    expect(response).toBe(raced.response);
+    expect(response.ok).toBe(true);
+    expect(handleSingleModel.mock.calls.filter(([, , isPanel]) => isPanel === undefined).map(([, model]) => model)).toEqual(["q/fast"]);
+    expect(maxActiveByProvider.get("p")).toBe(1);
+    expect(handleSingleModel).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps a timed-out panel provider busy while its upstream work may still run", async () => {
+    const detachedGate = deferred();
+    const detachedDone = deferred();
+    const handleSingleModel = vi.fn(async (_body, model, isPanel) => {
+      if (model === "p/timed-out") {
+        detachedGate.promise.then(() => detachedDone.resolve());
+        return { __timeout: true };
+      }
+      if (!isPanel) return okResponse("FINAL");
+      return okResponse(`fast-${model}`);
+    });
+
+    let response;
+    try {
+      response = await handleFusionChat({
+        body: { messages: [{ role: "user", content: "Q" }] },
+        models: ["p/fast", "q/fast", "p/timed-out"],
+        handleSingleModel,
+        log,
+        resolveModelProvider: async (model) => model.split("/")[0],
+        tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+      });
+    } finally {
+      detachedGate.resolve();
+    }
+    await detachedDone.promise;
+
+    expect(response.ok).toBe(true);
+    expect(handleSingleModel.mock.calls.filter(([, , isPanel]) => isPanel === undefined).map(([, model]) => model)).toEqual(["q/fast"]);
+  });
+
+  it("does not re-enter a busy unknown provider used by a nested combo", async () => {
+    const nestedGate = deferred();
+    const nestedDone = deferred();
+    let activeUnknown = 0;
+    let maxActiveUnknown = 0;
+    const handleSingleModel = vi.fn(async (_body, model, isPanel) => {
+      if (model === "inner-combo") {
+        activeUnknown++;
+        maxActiveUnknown = Math.max(maxActiveUnknown, activeUnknown);
+        try {
+          await nestedGate.promise;
+          nestedDone.resolve();
+          return okResponse("nested answer");
+        } finally {
+          activeUnknown--;
+        }
+      }
+      if (!isPanel) return okResponse("FINAL");
+      return okResponse(`fast-${model}`);
+    });
+
+    const fusion = handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["inner-combo", "q/fast", "r/fast"],
+      handleSingleModel,
+      log,
+      resolveModelProvider: async (model) => model === "inner-combo" ? null : model.split("/")[0],
+      tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+    });
+    let raced;
+    try {
+      raced = await Promise.race([
+        fusion.then((result) => ({ result })),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 250)),
+      ]);
+    } finally {
+      nestedGate.resolve();
+    }
+    await fusion;
+    await nestedDone.promise;
+
+    expect(raced.timedOut).not.toBe(true);
+    expect(raced.result.ok).toBe(true);
+    expect(maxActiveUnknown).toBe(1);
+    expect(handleSingleModel.mock.calls.filter(([, , isPanel]) => isPanel === undefined).map(([, model]) => model)).toEqual(["q/fast"]);
+  });
+
+  it("returns completed panel output when every judge provider still has a straggler", async () => {
+    const slowGate = deferred();
+    const slowDone = deferred();
+    const handleSingleModel = vi.fn(async (_body, model, isPanel) => {
+      if (model === "p/slow") {
+        await slowGate.promise;
+        slowDone.resolve();
+        return okResponse("slow");
+      }
+      if (!isPanel) throw new Error("busy provider was reused as judge");
+      return okResponse(`fast-${model}`);
+    });
+
+    const fusion = handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["p/first", "p/second", "p/slow"],
+      handleSingleModel,
+      log,
+      resolveModelProvider: async () => "p",
+      tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+    });
+    let raced;
+    try {
+      raced = await Promise.race([
+        fusion.then((response) => ({ response })),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 250)),
+      ]);
+    } finally {
+      slowGate.resolve();
+    }
+    await fusion;
+    await slowDone.promise;
+
+    expect(raced.timedOut).not.toBe(true);
+    expect(raced.response.ok).toBe(true);
+    expect(handleSingleModel.mock.calls.filter(([, , isPanel]) => isPanel === undefined)).toHaveLength(0);
+    expect(handleSingleModel).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry a lone answer through its busy provider", async () => {
+    const slowGate = deferred();
+    const slowDone = deferred();
+    const handleSingleModel = vi.fn(async (_body, model, isPanel) => {
+      if (model === "p/slow") {
+        await slowGate.promise;
+        slowDone.resolve();
+        return okResponse("slow");
+      }
+      if (model === "q/empty") return okResponse("");
+      if (!isPanel) throw new Error("busy provider was retried");
+      return okResponse("only answer");
+    });
+
+    const fusion = handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["p/fast", "q/empty", "p/slow"],
+      handleSingleModel,
+      log,
+      resolveModelProvider: async (model) => model.split("/")[0],
+      tuning: { minPanel: 2, stragglerGraceMs: 10, panelHardTimeoutMs: 1000 },
+    });
+    let raced;
+    try {
+      raced = await Promise.race([
+        fusion.then((response) => ({ response })),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 250)),
+      ]);
+    } finally {
+      slowGate.resolve();
+    }
+    await fusion;
+    await slowDone.promise;
+
+    expect(raced.timedOut).not.toBe(true);
+    expect(raced.response.ok).toBe(true);
+    expect(handleSingleModel.mock.calls.filter(([, , isPanel]) => isPanel === undefined)).toHaveLength(0);
+    expect(handleSingleModel).toHaveBeenCalledTimes(3);
   });
 
   it("returns the lone survivor directly when only one panel model succeeds", async () => {
