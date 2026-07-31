@@ -1,5 +1,5 @@
 import "open-sse/index.js";
-import { classifyProviderError } from "open-sse/services/accountFallback.js";
+import { classifyProviderErrorForRequest, setResponseErrorContext } from "open-sse/services/accountFallback.js";
 
 import {
   getProviderCredentials,
@@ -20,9 +20,27 @@ import { handleComboChat, handleFusionChat } from "open-sse/services/combo.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+import { detectFormat, resolveRequestRoute } from "open-sse/services/provider.js";
+import { getExecutor } from "open-sse/executors/index.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
+
+function resolveSourceFormat(request, body) {
+  if (!request?.url) return detectFormat(body);
+  return detectFormatByEndpoint(new URL(request.url).pathname, body) || detectFormat(body);
+}
+
+function resolveModelRequestContext(modelInfo, body, request) {
+  const { provider, model } = modelInfo;
+  const sourceFormat = resolveSourceFormat(request, body);
+  const { targetFormat: requestTargetFormat, runtimeTransport } = resolveRequestRoute(provider, model, sourceFormat);
+  const targetFormat = getExecutor(provider).getOutboundFormat?.(model, {
+    requestTargetFormat,
+    runtimeTransport,
+  }) || requestTargetFormat;
+  return { provider, model, sourceFormat, targetFormat };
+}
 
 /**
  * Handle chat completion request
@@ -126,6 +144,10 @@ export async function handleChat(request, clientRawRequest = null) {
       comboStrategy,
       comboStickyLimit,
       resolveModelProvider: async (comboModel) => (await getModelInfo(comboModel)).provider,
+      resolveModelContext: async (comboModel) => {
+        const modelInfo = await getModelInfo(comboModel);
+        return resolveModelRequestContext(modelInfo, body, request);
+      },
     });
   }
 
@@ -180,6 +202,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         comboStrategy,
         comboStickyLimit,
         resolveModelProvider: async (comboModel) => (await getModelInfo(comboModel)).provider,
+        resolveModelContext: async (comboModel) => {
+          const modelInfo = await getModelInfo(comboModel);
+          return resolveModelRequestContext(modelInfo, body, request);
+        },
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
@@ -187,6 +213,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   }
 
   const { provider, model } = modelInfo;
+  const requestContext = resolveModelRequestContext(modelInfo, body, request);
 
   // Routing shown in the unified "▶" line (client model → provider/model)
 
@@ -260,7 +287,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       onPxpipeEvent: appendPxpipeEvent,
       providerThinking,
       // Detect source format by endpoint + body
-      sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
+      sourceFormatOverride: requestContext.sourceFormat,
       onCredentialsRefreshed: async (newCreds) => {
         await updateProviderCredentials(credentials.connectionId, {
           ...newCreds,
@@ -275,14 +302,29 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     if (result.success) return result.response;
 
-    const classification = classifyProviderError(provider, result.status, result.error);
+    const targetFormat = result.targetFormat || requestContext.targetFormat;
+    const classification = classifyProviderErrorForRequest(
+      provider,
+      result.status,
+      result.error,
+      0,
+      { targetFormat }
+    );
     if (classification.category === "request_schema") {
-      log.warn("REQUEST", `Non-retryable Codex request schema error (${result.status})`);
-      return result.response;
+      log.warn("REQUEST", `Non-retryable provider request schema error (${result.status})`, { provider });
+      return setResponseErrorContext(result.response, { classification, targetFormat });
     }
 
     // Mark account unavailable (auto-calculates cooldown with exponential backoff, or precise resetsAtMs)
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, result.resetsAtMs);
+    const { shouldFallback } = await markAccountUnavailable(
+      credentials.connectionId,
+      result.status,
+      result.error,
+      provider,
+      model,
+      result.resetsAtMs,
+      { targetFormat }
+    );
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);

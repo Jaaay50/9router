@@ -7,35 +7,13 @@ const UNTRUSTED_STATELESS_ID_TYPES = new Set([
   RESPONSES_ITEM.CUSTOM_TOOL_CALL,
   RESPONSES_ITEM.CUSTOM_TOOL_CALL_OUTPUT,
 ]);
-const RESPONSE_ITEM_ID_PREFIXES = new Map([
-  [RESPONSES_ITEM.ADDITIONAL_TOOLS, "at"],
-  [RESPONSES_ITEM.MESSAGE, "msg"],
-  [RESPONSES_ITEM.AGENT_MESSAGE, "amsg"],
-  [RESPONSES_ITEM.REASONING, "rs"],
-  [RESPONSES_ITEM.LOCAL_SHELL_CALL, "lsh"],
-  [RESPONSES_ITEM.FUNCTION_CALL, "fc"],
-  [RESPONSES_ITEM.TOOL_SEARCH_CALL, "tsc"],
-  [RESPONSES_ITEM.FUNCTION_CALL_OUTPUT, "fco"],
-  [RESPONSES_ITEM.CUSTOM_TOOL_CALL, "ctc"],
-  [RESPONSES_ITEM.CUSTOM_TOOL_CALL_OUTPUT, "ctco"],
-  [RESPONSES_ITEM.TOOL_SEARCH_OUTPUT, "tso"],
-  [RESPONSES_ITEM.WEB_SEARCH_CALL, "ws"],
-  [RESPONSES_ITEM.IMAGE_GENERATION_CALL, "ig"],
-  [RESPONSES_ITEM.COMPACTION, "cmp"],
-  [RESPONSES_ITEM.CONTEXT_COMPACTION, "cmp"],
-]);
-
-function getResponseItemType(item) {
-  return item.type || (item.role ? RESPONSES_ITEM.MESSAGE : null);
-}
 
 /**
  * Remove stored references and untrusted item IDs from a stateless Responses replay.
  * Tool call/output IDs are always omitted because call_id is the correlation key.
- * Other known IDs are retained only when their type-specific prefix is valid.
- * Unknown types retain plausible typed IDs but drop generic item_* replay IDs.
+ * Every other item is preserved because its ID may carry provider-specific state.
  */
-export function normalizeStatelessResponseInput(input, { stripUnknownIds = false } = {}) {
+export function normalizeStatelessResponseInput(input) {
   const strippedIds = {};
   if (!Array.isArray(input)) return { input, strippedIds };
 
@@ -45,23 +23,11 @@ export function normalizeStatelessResponseInput(input, { stripUnknownIds = false
     if (item.type === RESPONSES_ITEM.ITEM_REFERENCE) return [];
     if (!Object.hasOwn(item, "id")) return [item];
 
-    const type = getResponseItemType(item);
-    const expectedPrefix = RESPONSE_ITEM_ID_PREFIXES.get(type);
-    const hasExpectedId = typeof item.id === "string"
-      && expectedPrefix
-      && item.id.startsWith(`${expectedPrefix}_`)
-      && item.id.length > expectedPrefix.length + 1;
-    const hasPlausibleUnknownId = typeof item.id === "string"
-      && item.id.length > 0
-      && !item.id.startsWith("item_");
-    const shouldStrip = UNTRUSTED_STATELESS_ID_TYPES.has(type)
-      || (expectedPrefix ? !hasExpectedId : (stripUnknownIds && !hasPlausibleUnknownId));
-
-    if (!shouldStrip) return [item];
+    const type = item.type;
+    if (!UNTRUSTED_STATELESS_ID_TYPES.has(type)) return [item];
     const normalizedItem = { ...item };
     delete normalizedItem.id;
-    const countKey = type || "unknown";
-    strippedIds[countKey] = (strippedIds[countKey] || 0) + 1;
+    strippedIds[type] = (strippedIds[type] || 0) + 1;
     return [normalizedItem];
   });
 

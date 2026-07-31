@@ -2,6 +2,7 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
+import { FORMATS } from "../translator/formats.js";
 
 // Models that use /zen/go/v1/messages (Anthropic/Claude format + x-api-key auth)
 const MESSAGES_FORMAT_MODELS = new Set([
@@ -20,10 +21,18 @@ export class OpenCodeGoExecutor extends BaseExecutor {
     super("opencode-go", PROVIDERS["opencode-go"]);
   }
 
+  usesMessagesEndpoint(model) {
+    return MESSAGES_FORMAT_MODELS.has(model);
+  }
+
+  getOutboundFormat(model, credentials) {
+    return this.usesMessagesEndpoint(model) ? FORMATS.CLAUDE : super.getOutboundFormat(model, credentials);
+  }
+
   // buildUrl runs before buildHeaders in BaseExecutor.execute, cache model here
   buildUrl(model) {
     this._lastModel = model;
-    return MESSAGES_FORMAT_MODELS.has(model)
+    return this.usesMessagesEndpoint(model)
       ? `${BASE}/messages`
       : `${BASE}/chat/completions`;
   }
@@ -32,7 +41,7 @@ export class OpenCodeGoExecutor extends BaseExecutor {
     const key = credentials?.apiKey || credentials?.accessToken;
     const headers = { "Content-Type": "application/json" };
 
-    if (MESSAGES_FORMAT_MODELS.has(this._lastModel)) {
+    if (this.usesMessagesEndpoint(this._lastModel)) {
       headers["x-api-key"] = key;
       headers["anthropic-version"] = ANTHROPIC_API_VERSION;
     } else {

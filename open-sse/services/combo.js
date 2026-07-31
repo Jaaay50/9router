@@ -2,7 +2,7 @@
  * Shared combo (model combo) handling with fallback support
  */
 
-import { classifyProviderError, formatRetryAfter } from "./accountFallback.js";
+import { classifyProviderErrorForRequest, formatRetryAfter, getResponseErrorContext } from "./accountFallback.js";
 import { parseModel } from "./model.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
@@ -250,9 +250,10 @@ function retryAfterFromResponse(response) {
  * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
  * @param {Function} [options.resolveModelProvider] - Resolve aliases to canonical provider IDs
+ * @param {Function} [options.resolveModelContext] - Resolve provider and final outbound format
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, resolveModelProvider = null }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, resolveModelProvider = null, resolveModelContext = null }) {
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -272,15 +273,25 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   let earliestRetryAfter = null;
   let lastStatus = null;
   let requestSchemaResponse = null;
-  const blockedProviders = new Set();
+  const blockedProviderFormats = new Set();
+
+  const providerFormatKey = (provider, targetFormat) => `${provider || "unknown"}\u0000${targetFormat || "*"}`;
+  const providerHasAnyBlock = (provider) => {
+    const prefix = `${provider || "unknown"}\u0000`;
+    return [...blockedProviderFormats].some(key => key.startsWith(prefix));
+  };
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
 
     try {
-      const provider = await resolveComboProvider(modelStr, resolveModelProvider);
-      if (provider && blockedProviders.has(provider)) {
-        log.info("COMBO", `Skipping model ${modelStr}: provider ${provider} rejected the request schema`);
+      const modelContext = resolveModelContext ? await resolveModelContext(modelStr) : null;
+      const provider = modelContext?.provider || await resolveComboProvider(modelStr, resolveModelProvider);
+      const targetFormat = modelContext?.targetFormat || null;
+      const blocked = blockedProviderFormats.has(providerFormatKey(provider, targetFormat))
+        || (!targetFormat && providerHasAnyBlock(provider));
+      if (provider && blocked) {
+        log.info("COMBO", `Skipping model ${modelStr}: provider ${provider} rejected ${targetFormat || "this"} request schema`);
         continue;
       }
       log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
@@ -315,10 +326,18 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         try { errorText = JSON.stringify(errorText); } catch { errorText = String(errorText); }
       }
 
-      const classification = classifyProviderError(provider, result.status, errorPayload || errorText);
+      const responseContext = getResponseErrorContext(result);
+      const effectiveTargetFormat = responseContext?.targetFormat || targetFormat;
+      const classification = responseContext?.classification || classifyProviderErrorForRequest(
+        provider,
+        result.status,
+        errorPayload || errorText,
+        0,
+        { targetFormat: effectiveTargetFormat }
+      );
       if (classification.comboScope === "provider") {
         if (!requestSchemaResponse) requestSchemaResponse = result;
-        if (provider) blockedProviders.add(provider);
+        if (provider) blockedProviderFormats.add(providerFormatKey(provider, effectiveTargetFormat));
         log.warn("COMBO", `Provider ${provider || "unknown"} rejected the request schema`, { status: result.status });
         continue;
       }

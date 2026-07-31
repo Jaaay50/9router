@@ -29,6 +29,12 @@ export class GithubExecutor extends BaseExecutor {
     return /claude/i.test(model || "");
   }
 
+  getOutboundFormat(model, credentials) {
+    if (this.isClaudeModel(model)) return FORMATS.CLAUDE;
+    if (this.knownCodexModels.has(model)) return FORMATS.OPENAI_RESPONSES;
+    return super.getOutboundFormat(model, credentials);
+  }
+
   buildUrl(model, stream, urlIndex = 0) {
     return this.config.baseUrl;
   }
@@ -180,7 +186,7 @@ export class GithubExecutor extends BaseExecutor {
     }, proxyOptions);
 
     if (!response.ok) {
-      return { response, url, headers, transformedBody };
+      return { response, url, headers, transformedBody, requestFormat: FORMATS.OPENAI_RESPONSES };
     }
 
     const state = initState("openai-responses");
@@ -229,7 +235,7 @@ export class GithubExecutor extends BaseExecutor {
     });
 
     if (!response.body) {
-      return { response: new Response("", { status: response.status, headers: response.headers }), url, headers, transformedBody };
+      return { response: new Response("", { status: response.status, headers: response.headers }), url, headers, transformedBody, requestFormat: FORMATS.OPENAI_RESPONSES };
     }
     const convertedStream = response.body.pipeThrough(transformStream);
 
@@ -241,7 +247,8 @@ export class GithubExecutor extends BaseExecutor {
       }),
       url,
       headers,
-      transformedBody
+      transformedBody,
+      requestFormat: FORMATS.OPENAI_RESPONSES,
     };
   }
 
@@ -250,20 +257,33 @@ export class GithubExecutor extends BaseExecutor {
   // This is what makes prepareClaudeRequest() (translator/formats/claude.js) inject
   // cache_control — /chat/completions never gets there, so it never sees cache tokens.
   async executeWithMessagesEndpoint({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
-    const url = this.config.messagesUrl;
-    const headers = this.buildHeaders(credentials, stream);
+    let url = this.config.messagesUrl;
+    let headers = this.buildHeaders(credentials, stream);
 
     // Force stream:true upstream regardless of client preference, same as
     // executeWithResponsesEndpoint below — chatCore.js's non-streaming handler already
     // knows how to buffer an SSE response into a single JSON reply when the client
     // asked for stream:false.
-    const transformedBody = translateRequest(FORMATS.OPENAI, FORMATS.CLAUDE, model, body, true, credentials, "github");
+    let transformedBody = translateRequest(FORMATS.OPENAI, FORMATS.CLAUDE, model, body, true, credentials, "github");
     // _toolNameMap is internal bookkeeping (see openai-to-claude.js) — chatCore.js
     // normally strips it before dispatch and threads it into the response state to
     // restore original tool names; we must do the same here, or Anthropic's strict
     // schema rejects the extra field with a 400.
     const toolNameMap = transformedBody._toolNameMap;
     delete transformedBody._toolNameMap;
+
+    const finalized = this.finalizeOutboundRequest({
+      url,
+      headers,
+      transformedBody,
+      credentials,
+      model,
+      stream,
+      targetFormat: FORMATS.CLAUDE,
+    });
+    url = finalized.url ?? url;
+    headers = finalized.headers ?? headers;
+    transformedBody = finalized.transformedBody ?? transformedBody;
 
     log?.debug("GITHUB", "Sending translated request to /v1/messages");
 
@@ -275,7 +295,7 @@ export class GithubExecutor extends BaseExecutor {
     }, proxyOptions);
 
     if (!response.ok) {
-      return { response, url, headers, transformedBody };
+      return { response, url, headers, transformedBody, requestFormat: FORMATS.CLAUDE };
     }
 
     const state = initState(FORMATS.CLAUDE);
@@ -324,7 +344,7 @@ export class GithubExecutor extends BaseExecutor {
     });
 
     if (!response.body) {
-      return { response: new Response("", { status: response.status, headers: response.headers }), url, headers, transformedBody };
+      return { response: new Response("", { status: response.status, headers: response.headers }), url, headers, transformedBody, requestFormat: FORMATS.CLAUDE };
     }
     const convertedStream = response.body.pipeThrough(transformStream);
 
@@ -336,7 +356,8 @@ export class GithubExecutor extends BaseExecutor {
       }),
       url,
       headers,
-      transformedBody
+      transformedBody,
+      requestFormat: FORMATS.CLAUDE,
     };
   }
 

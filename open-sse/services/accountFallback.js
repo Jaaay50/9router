@@ -7,8 +7,16 @@ import {
   CODEX_REQUEST_SCHEMA_PARAM_ROOTS,
   CODEX_ITEM_ID_PARAM_PATTERN,
   CODEX_ITEM_ID_MESSAGE_PATTERN,
+  CLAUDE_SCHEMA_FIELD_MESSAGE_PATTERN,
+  CLAUDE_BETA_HEADER_MESSAGE_PATTERN,
+  CLAUDE_INVALID_PROMPT_MESSAGE_PATTERN,
+  CLAUDE_PERMISSION_MESSAGE_PATTERN,
   REQUEST_SCHEMA_CLASSIFICATION,
 } from "../config/errorConfig.js";
+import { getTargetFormat } from "./provider.js";
+import { FORMATS } from "../translator/formats.js";
+
+const responseErrorContexts = new WeakMap();
 
 function parseJsonErrorText(value) {
   if (typeof value !== "string") return null;
@@ -43,6 +51,10 @@ function normalizeErrorPayload(value, depth = 0) {
     return { message: String(value || "") };
   }
 
+  if (String(value.type || "").toLowerCase() === "error"
+      && value.error && typeof value.error === "object" && !Array.isArray(value.error)) {
+    return normalizeErrorPayload(value.error, depth + 1);
+  }
   if (hasErrorMetadata(value) && !isGenericBadRequestWrapper(value)) return value;
   if (isGenericBadRequestWrapper(value)) {
     const parsed = parseJsonErrorText(value.message);
@@ -99,8 +111,31 @@ export function isCodexRequestSchemaError(provider, status, errorValue = "") {
   return metadataAllowsMessageOnly && schemaField && CODEX_REQUEST_SCHEMA_MESSAGE_PATTERN.test(message);
 }
 
-export function classifyProviderError(provider, status, errorText, backoffLevel = 0) {
-  if (isCodexRequestSchemaError(provider, status, errorText)) {
+export function isClaudeRequestSchemaErrorForRequest(targetFormat, status, errorValue = "") {
+  if (Number(status) !== 400 || targetFormat !== FORMATS.CLAUDE) return false;
+
+  const error = normalizeErrorPayload(errorValue);
+  const type = String(error?.type || "").toLowerCase();
+  const code = String(error?.code || "").toLowerCase();
+  const message = String(error?.message || (typeof error?.error === "string" ? error.error : ""));
+
+  if (code === "invalid_prompt" || type === "invalid_prompt"
+      || CLAUDE_INVALID_PROMPT_MESSAGE_PATTERN.test(message)) return false;
+  if (type && type !== "invalid_request_error") return false;
+  if (CLAUDE_PERMISSION_MESSAGE_PATTERN.test(message)) return false;
+
+  return CLAUDE_SCHEMA_FIELD_MESSAGE_PATTERN.test(message)
+    || CLAUDE_BETA_HEADER_MESSAGE_PATTERN.test(message);
+}
+
+export function isClaudeRequestSchemaError(provider, status, errorValue = "") {
+  return isClaudeRequestSchemaErrorForRequest(getTargetFormat(provider), status, errorValue);
+}
+
+export function classifyProviderErrorForRequest(provider, status, errorText, backoffLevel = 0, context = null) {
+  const targetFormat = context?.targetFormat || getTargetFormat(provider);
+  if (isCodexRequestSchemaError(provider, status, errorText)
+      || isClaudeRequestSchemaErrorForRequest(targetFormat, status, errorText)) {
     return { ...REQUEST_SCHEMA_CLASSIFICATION };
   }
 
@@ -112,6 +147,23 @@ export function classifyProviderError(provider, status, errorText, backoffLevel 
     comboScope: "model",
     ...(newBackoffLevel === undefined ? {} : { newBackoffLevel }),
   };
+}
+
+export function classifyProviderError(provider, status, errorText, backoffLevel = 0) {
+  return classifyProviderErrorForRequest(provider, status, errorText, backoffLevel);
+}
+
+export function setResponseErrorContext(response, context) {
+  if (response && (typeof response === "object" || typeof response === "function")) {
+    responseErrorContexts.set(response, context);
+  }
+  return response;
+}
+
+export function getResponseErrorContext(response) {
+  return response && (typeof response === "object" || typeof response === "function")
+    ? responseErrorContexts.get(response) || null
+    : null;
 }
 
 /**

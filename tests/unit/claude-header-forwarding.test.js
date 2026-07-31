@@ -11,6 +11,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { FORMATS } from "open-sse/translator/formats.js";
 
 // ─── claudeHeaderCache ────────────────────────────────────────────────────────
 
@@ -42,6 +43,7 @@ describe("claudeHeaderCache", () => {
       "x-stainless-helper-method": "stream",
       "x-stainless-retry-count": "0",
       "x-stainless-timeout": "600",
+      "x-claude-code-session-id": "session-must-not-be-global",
       "anthropic-dangerous-direct-browser-access": "true",
       // Non-identity header — should NOT be captured
       "content-type": "application/json",
@@ -50,7 +52,8 @@ describe("claudeHeaderCache", () => {
     const cached = cacheModule.getCachedClaudeHeaders();
     expect(cached).not.toBeNull();
     expect(cached["user-agent"]).toBe("claude-code/2.1.63 node/24.3.0");
-    expect(cached["anthropic-beta"]).toBe("claude-code-20250219,oauth-2025-04-20");
+    expect(cached["anthropic-beta"]).toBeUndefined();
+    expect(cached["x-claude-code-session-id"]).toBeUndefined();
     expect(cached["x-app"]).toBe("cli");
     expect(cached["x-stainless-os"]).toBe("MacOS");
     // Non-identity header must not leak in
@@ -126,7 +129,7 @@ describe("DefaultExecutor.buildHeaders() — claude provider", () => {
     const cache = await import("open-sse/utils/claudeHeaderCache.js");
     cache.cacheClaudeHeaders({
       "user-agent": "claude-code/2.1.63 node/24.3.0",
-      "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+      "anthropic-beta": "request-only-beta-2099-01-01",
       "anthropic-version": "2023-06-01",
       "anthropic-dangerous-direct-browser-access": "true",
       "x-app": "cli",
@@ -150,11 +153,12 @@ describe("DefaultExecutor.buildHeaders() — claude provider", () => {
 
     // Live values should win over static providers.js values
     expect(headers["user-agent"]).toBe("claude-code/2.1.63 node/24.3.0");
-    // Beta flags are MERGED (static + cached) to preserve required flags like oauth
-    const betaFlags = headers["anthropic-beta"].split(",").map(s => s.trim());
+    // Request beta is intentionally excluded from the global identity cache.
+    const betaFlags = (headers["anthropic-beta"] || headers["Anthropic-Beta"]).split(",").map(s => s.trim());
     expect(betaFlags).toContain("claude-code-20250219");
     expect(betaFlags).toContain("oauth-2025-04-20");
     expect(betaFlags).toContain("interleaved-thinking-2025-05-14");
+    expect(betaFlags).not.toContain("request-only-beta-2099-01-01");
     expect(headers["x-stainless-package-version"]).toBe("0.74.0");
     expect(headers["x-stainless-os"]).toBe("MacOS");
   });
@@ -163,9 +167,10 @@ describe("DefaultExecutor.buildHeaders() — claude provider", () => {
     const executor = new DefaultExecutor("claude");
     const headers = executor.buildHeaders({ apiKey: "sk-test" }, true);
 
-    // Title-Case variants from providers.js must be gone
+    // Cached identity headers replace their Title-Case static variants.
     expect(headers["Anthropic-Version"]).toBeUndefined();
-    expect(headers["Anthropic-Beta"]).toBeUndefined();
+    // Beta remains static until request-scoped finalization canonicalizes it.
+    expect(headers["Anthropic-Beta"]).toBeDefined();
     expect(headers["User-Agent"]).toBeUndefined();
     expect(headers["X-App"]).toBeUndefined();
     // Lowercase variants must be present
@@ -228,10 +233,16 @@ describe("DefaultExecutor.buildHeaders() — claude provider cold start (no cach
   });
 });
 
-// ─── anthropic-compatible header stripping ────────────────────────────────────
+// ─── anthropic-compatible final outbound policy ───────────────────────────────
 
-describe("DefaultExecutor.buildHeaders() — anthropic-compatible stripping", () => {
+describe("DefaultExecutor.finalizeOutboundRequest() — anthropic-compatible stripping", () => {
   let DefaultExecutor;
+
+  function finalize(executor, credentials, body = { messages: [] }, stream = true) {
+    const url = executor.buildUrl("claude-test", stream, 0, credentials);
+    const headers = executor.buildHeaders(credentials, stream);
+    return executor.finalizeOutboundRequest({ url, headers, transformedBody: body, credentials });
+  }
 
   beforeEach(async () => {
     vi.resetModules();
@@ -241,29 +252,44 @@ describe("DefaultExecutor.buildHeaders() — anthropic-compatible stripping", ()
 
   it("strips x-app and anthropic-dangerous-direct-browser-access for non-Anthropic host", () => {
     const executor = new DefaultExecutor("anthropic-compatible-custom");
-    const headers = executor.buildHeaders(
-      {
-        apiKey: "key",
-        providerSpecificData: { baseUrl: "https://myproxy.example.com/v1" },
-      },
-      true
-    );
+    const credentials = {
+      apiKey: "key",
+      providerSpecificData: { baseUrl: "https://myproxy.example.com/v1" },
+    };
+    const initialHeaders = executor.buildHeaders(credentials, true);
+    initialHeaders["x-app"] = "cli";
+    initialHeaders["anthropic-dangerous-direct-browser-access"] = "true";
+    initialHeaders["x-claude-code-session-id"] = "stale-global-session";
+    const { headers } = executor.finalizeOutboundRequest({
+      url: executor.buildUrl("claude-test", true, 0, credentials),
+      headers: initialHeaders,
+      transformedBody: { messages: [] },
+      credentials,
+    });
 
     expect(headers["x-app"]).toBeUndefined();
     expect(headers["X-App"]).toBeUndefined();
     expect(headers["anthropic-dangerous-direct-browser-access"]).toBeUndefined();
     expect(headers["Anthropic-Dangerous-Direct-Browser-Access"]).toBeUndefined();
+    expect(headers["x-claude-code-session-id"]).toBeUndefined();
   });
 
   it("removes claude-code-20250219 from anthropic-beta for non-Anthropic host", () => {
     const executor = new DefaultExecutor("anthropic-compatible-custom");
-    const headers = executor.buildHeaders(
-      {
-        apiKey: "key",
-        providerSpecificData: { baseUrl: "https://myproxy.example.com/v1" },
-      },
-      true
-    );
+    const credentials = {
+      apiKey: "key",
+      providerSpecificData: { baseUrl: "https://myproxy.example.com/v1" },
+    };
+    const initialHeaders = {
+      ...executor.buildHeaders(credentials, true),
+      "Anthropic-Beta": "claude-code-20250219,interleaved-thinking-2025-05-14",
+    };
+    const { headers } = executor.finalizeOutboundRequest({
+      url: executor.buildUrl("claude-test", true, 0, credentials),
+      headers: initialHeaders,
+      transformedBody: { messages: [] },
+      credentials,
+    });
 
     const betaVal = headers["anthropic-beta"] || headers["Anthropic-Beta"] || "";
     expect(betaVal).not.toContain("claude-code-20250219");
@@ -271,15 +297,20 @@ describe("DefaultExecutor.buildHeaders() — anthropic-compatible stripping", ()
 
   it("keeps other beta flags intact after stripping", () => {
     const executor = new DefaultExecutor("anthropic-compatible-custom");
-    // The static CLAUDE_API_HEADERS used by anthropic-compatible providers include
-    // 'interleaved-thinking-2025-05-14' — check it survives stripping
-    const headers = executor.buildHeaders(
-      {
-        apiKey: "key",
-        providerSpecificData: { baseUrl: "https://myproxy.example.com/v1" },
-      },
-      false
-    );
+    const credentials = {
+      apiKey: "key",
+      providerSpecificData: { baseUrl: "https://myproxy.example.com/v1" },
+    };
+    const initialHeaders = {
+      ...executor.buildHeaders(credentials, false),
+      "Anthropic-Beta": "claude-code-20250219,interleaved-thinking-2025-05-14",
+    };
+    const { headers } = executor.finalizeOutboundRequest({
+      url: executor.buildUrl("claude-test", false, 0, credentials),
+      headers: initialHeaders,
+      transformedBody: { messages: [] },
+      credentials,
+    });
 
     const betaVal = headers["anthropic-beta"] || headers["Anthropic-Beta"] || "";
     // If any beta value remains it should not be empty and should not have the stripped value
@@ -290,13 +321,11 @@ describe("DefaultExecutor.buildHeaders() — anthropic-compatible stripping", ()
 
   it("does NOT strip headers when baseUrl is api.anthropic.com", () => {
     const executor = new DefaultExecutor("anthropic-compatible-official");
-    const headers = executor.buildHeaders(
-      {
-        apiKey: "key",
-        providerSpecificData: { baseUrl: "https://api.anthropic.com/v1" },
-      },
-      true
-    );
+    const credentials = {
+      apiKey: "key",
+      providerSpecificData: { baseUrl: "https://api.anthropic.com/v1" },
+    };
+    const { headers } = finalize(executor, credentials);
 
     // No stripping — anthropic-version should survive
     const hasVersion =
@@ -306,17 +335,245 @@ describe("DefaultExecutor.buildHeaders() — anthropic-compatible stripping", ()
 
   it("does NOT strip headers when baseUrl is empty (defaults to Anthropic)", () => {
     const executor = new DefaultExecutor("anthropic-compatible-official");
-    const headers = executor.buildHeaders(
-      {
-        apiKey: "key",
-        providerSpecificData: {},
-      },
-      true
-    );
+    const credentials = { apiKey: "key", providerSpecificData: {} };
+    const { headers } = finalize(executor, credentials);
 
     const hasVersion =
       headers["Anthropic-Version"] || headers["anthropic-version"];
     expect(hasVersion).toBeDefined();
+  });
+});
+
+describe("DefaultExecutor.finalizeOutboundRequest() — Anthropic beta policy", () => {
+  let DefaultExecutor;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    const mod = await import("open-sse/executors/default.js");
+    DefaultExecutor = mod.DefaultExecutor || mod.default;
+  });
+
+  function finalize(provider, { url, body, credentials = {}, headers = {} }) {
+    const executor = new DefaultExecutor(provider);
+    return executor.finalizeOutboundRequest({ url, headers, transformedBody: body, credentials });
+  }
+
+  it("derives all required beta flags from the final body for the official endpoint", () => {
+    const credentials = {
+      apiKey: "connection-key",
+      rawHeaders: {
+        "anthropic-beta": "future-feature-2099-01-01,invalid beta,header\r\ninjection",
+        "x-claude-code-session-id": "session-current-request",
+        authorization: "Bearer client-token",
+        "x-api-key": "client-key",
+        cookie: "session=client-cookie",
+        "x-arbitrary": "not-forwarded",
+      },
+    };
+    const executor = new DefaultExecutor("anthropic");
+    const headers = executor.buildHeaders(credentials, true);
+    const body = {
+      messages: [],
+      context_management: null,
+      output_config: { effort: null, format: null },
+      tools: [{ name: "search", input_examples: [] }],
+    };
+    const finalized = executor.finalizeOutboundRequest({
+      url: "https://api.anthropic.com/v1/messages",
+      headers,
+      transformedBody: body,
+      credentials,
+    });
+
+    const betaFlags = finalized.headers["anthropic-beta"].split(",");
+    expect(betaFlags).toEqual(expect.arrayContaining([
+      "claude-code-20250219",
+      "interleaved-thinking-2025-05-14",
+      "future-feature-2099-01-01",
+      "context-management-2025-06-27",
+      "effort-2025-11-24",
+      "advanced-tool-use-2025-11-20",
+      "structured-outputs-2025-12-15",
+    ]));
+    expect(betaFlags).not.toContain("invalid beta");
+    expect(finalized.transformedBody.context_management).toBeNull();
+    expect(finalized.headers["x-api-key"]).toBe("connection-key");
+    expect(finalized.headers["x-claude-code-session-id"]).toBe("session-current-request");
+    expect(finalized.headers.Authorization).toBeUndefined();
+    expect(finalized.headers.cookie).toBeUndefined();
+    expect(finalized.headers["x-arbitrary"]).toBeUndefined();
+  });
+
+  it.each([
+    "session-with\r\ninjected-header",
+    "\r\nsession-with-leading-newline",
+    "session-with-trailing-newline\r\n",
+    "x".repeat(257),
+    `${" ".repeat(257)}session-after-overlong-whitespace`,
+  ])("rejects an invalid request-scoped Claude session ID", sessionId => {
+    const result = finalize("anthropic", {
+      url: "https://api.anthropic.com/v1/messages",
+      credentials: { rawHeaders: { "x-claude-code-session-id": sessionId } },
+      headers: { "x-claude-code-session-id": "stale-global-session" },
+      body: { messages: [] },
+    });
+
+    expect(result.headers["x-claude-code-session-id"]).toBeUndefined();
+  });
+
+  it.each([
+    {
+      provider: "claude",
+      credentials: { accessToken: "oauth-token" },
+      expectedAuth: ["Authorization", "Bearer oauth-token"],
+    },
+    {
+      provider: "anthropic-compatible-official",
+      credentials: {
+        apiKey: "compatible-key",
+        providerSpecificData: { baseUrl: "https://api.anthropic.com/v1" },
+      },
+      expectedAuth: ["x-api-key", "compatible-key"],
+    },
+  ])("applies the official policy for $provider", ({ provider, credentials, expectedAuth }) => {
+    const executor = new DefaultExecutor(provider);
+    const body = { messages: [], context_management: { edits: [] } };
+    const url = executor.buildUrl("claude-test", true, 0, credentials);
+    const result = executor.finalizeOutboundRequest({
+      url,
+      headers: executor.buildHeaders(credentials, true),
+      transformedBody: body,
+      credentials,
+    });
+
+    expect(result.transformedBody.context_management).toEqual({ edits: [] });
+    expect(result.headers["anthropic-beta"]).toContain("context-management-2025-06-27");
+    expect(result.headers[expectedAuth[0]]).toBe(expectedAuth[1]);
+    if (provider.startsWith("anthropic-compatible-")) {
+      expect(result.headers.Authorization).toBeUndefined();
+    }
+  });
+
+  it.each([
+    "http://api.anthropic.com/v1/messages",
+    "https://api.anthropic.com.evil.example/v1/messages",
+    "https://anthropic.example.com/v1/messages",
+  ])("treats %s as non-official and removes context management", url => {
+    const result = finalize("anthropic-compatible-custom", {
+      url,
+      headers: {
+        "Anthropic-Beta": "context-management-2025-06-27,interleaved-thinking-2025-05-14",
+      },
+      body: { messages: [], context_management: null },
+    });
+
+    expect(result.transformedBody).not.toHaveProperty("context_management");
+    expect(result.headers["anthropic-beta"]).toBe("interleaved-thinking-2025-05-14");
+  });
+
+  it("allows an internal Claude transport to opt in to explicit beta features", () => {
+    const credentials = {
+      rawHeaders: { "anthropic-beta": "allowed-future-2099-01-01,blocked-future-2099-01-01" },
+      runtimeTransport: {
+        format: FORMATS.CLAUDE,
+        quirks: {
+          anthropicBetaFeatures: [
+            "context-management-2025-06-27",
+            "allowed-future-2099-01-01",
+          ],
+        },
+      },
+    };
+    const result = finalize("anthropic-compatible-internal", {
+      url: "https://internal-claude.example.com/messages",
+      credentials,
+      headers: {},
+      body: { messages: [], context_management: null },
+    });
+
+    expect(result.transformedBody.context_management).toBeNull();
+    expect(result.headers["anthropic-beta"].split(",")).toEqual([
+      "allowed-future-2099-01-01",
+      "context-management-2025-06-27",
+    ]);
+  });
+
+  it("does not fall back to provider quirks when a runtime Claude transport is selected", () => {
+    const executor = new DefaultExecutor("kimi");
+    executor.config = {
+      ...executor.config,
+      quirks: { anthropicBetaFeatures: ["context-management-2025-06-27"] },
+    };
+    const credentials = {
+      runtimeTransport: { format: FORMATS.CLAUDE, quirks: {} },
+    };
+    const result = executor.finalizeOutboundRequest({
+      url: "https://internal-claude.example.com/messages",
+      headers: { "Anthropic-Beta": "context-management-2025-06-27" },
+      transformedBody: { messages: [], context_management: null },
+      credentials,
+    });
+
+    expect(result.transformedBody).not.toHaveProperty("context_management");
+    expect(result.headers["anthropic-beta"]).toBeUndefined();
+  });
+
+  it.each(["kimi", "minimax"])("leaves %s OpenAI runtime transport requests untouched", provider => {
+    const executor = new DefaultExecutor(provider);
+    const runtimeTransport = executor.config.transports.find(transport => transport.format === FORMATS.OPENAI);
+    const credentials = {
+      apiKey: "runtime-key",
+      runtimeTransport,
+      rawHeaders: {
+        "anthropic-beta": "request-beta-2099-01-01",
+        "x-claude-code-session-id": "request-session",
+      },
+    };
+    const url = executor.buildUrl("runtime-model", true, 0, credentials);
+    const headers = executor.buildHeaders(credentials, true);
+    const body = { messages: [], context_management: null };
+    const result = executor.finalizeOutboundRequest({
+      url,
+      headers,
+      transformedBody: body,
+      credentials,
+    });
+
+    expect(result.headers).toBe(headers);
+    expect(result.transformedBody).toBe(body);
+    expect(result.transformedBody.context_management).toBeNull();
+    expect(result.headers["anthropic-beta"]).toBeUndefined();
+    expect(result.headers["x-claude-code-session-id"]).toBeUndefined();
+  });
+
+  it("keeps request beta flags and session IDs isolated across concurrent finalization", async () => {
+    const executor = new DefaultExecutor("anthropic");
+    const run = (beta, sessionId) => Promise.resolve().then(() => executor.finalizeOutboundRequest({
+      url: "https://api.anthropic.com/v1/messages",
+      headers: {
+        "Anthropic-Beta": "static-beta-2025-01-01",
+        "x-claude-code-session-id": "stale-global-session",
+      },
+      transformedBody: { messages: [] },
+      credentials: {
+        rawHeaders: {
+          "anthropic-beta": beta,
+          "x-claude-code-session-id": sessionId,
+        },
+      },
+    }));
+
+    const [first, second] = await Promise.all([
+      run("request-one-2099-01-01", "session-one"),
+      run("request-two-2099-01-01", "session-two"),
+    ]);
+
+    expect(first.headers["anthropic-beta"]).toContain("request-one-2099-01-01");
+    expect(first.headers["anthropic-beta"]).not.toContain("request-two-2099-01-01");
+    expect(second.headers["anthropic-beta"]).toContain("request-two-2099-01-01");
+    expect(second.headers["anthropic-beta"]).not.toContain("request-one-2099-01-01");
+    expect(first.headers["x-claude-code-session-id"]).toBe("session-one");
+    expect(second.headers["x-claude-code-session-id"]).toBe("session-two");
   });
 });
 

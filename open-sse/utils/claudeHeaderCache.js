@@ -6,7 +6,6 @@
 
 const CLAUDE_IDENTITY_HEADERS = [
   "user-agent",
-  "anthropic-beta",
   "anthropic-version",
   "anthropic-dangerous-direct-browser-access",
   "x-app",
@@ -19,7 +18,6 @@ const CLAUDE_IDENTITY_HEADERS = [
   "x-stainless-arch",
   "x-stainless-os",
   "x-stainless-timeout",
-  "x-claude-code-session-id",
   "package-version",
   "runtime-version",
   "os",

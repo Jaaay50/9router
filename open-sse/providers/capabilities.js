@@ -102,8 +102,9 @@ const CLAUDE_ADAPTIVE_1M_CAPABILITIES = {
 
 // Keep the version boundary strict so future families such as Opus 5.1 do not
 // inherit 5.0 capabilities before their limits are verified. Aliases may append
-// named transport variants or YYYY[-MM[-DD]] release dates.
-const CLAUDE_ALIAS_SUFFIX = String.raw`(?=$|[-_.:@](?:[a-z][a-z0-9]*|\d{4}(?:[-_.]?\d{2}){0,2})(?:$|[-_.:@]))`;
+// named transport variants, numeric-unit labels (for example 1m), or
+// YYYY[-MM[-DD]] release dates.
+const CLAUDE_ALIAS_SUFFIX = String.raw`(?=$|[-_.:@](?:[a-z][a-z0-9]*|\d+[a-z][a-z0-9]*|\d{4}(?:[-_.]?\d{2}){0,2})(?:$|[-_.:@]))`;
 const CLAUDE_ADAPTIVE_FAMILY_PATTERNS = [
   new RegExp(String.raw`(?:^|[^a-z0-9])claude[-_.]+opus[-_.]+(?:4[.-](?:6|7|8)|5)${CLAUDE_ALIAS_SUFFIX}`, "i"),
   new RegExp(String.raw`(?:^|[^a-z0-9])claude[-_.]+sonnet[-_.]+(?:4[.-](?:6|7)|5)${CLAUDE_ALIAS_SUFFIX}`, "i"),

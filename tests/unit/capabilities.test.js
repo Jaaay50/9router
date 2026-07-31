@@ -34,9 +34,12 @@ describe("getCapabilitiesForModel", () => {
       "claude-opus-5",
       "claude-opus-5-thinking-agentic",
       "claude-sonnet-4.6",
+      "claude-sonnet-4.6-1m",
       "claude-sonnet-4-6-thinking",
+      "claude-sonnet-4.6-thinking-1m",
       "anthropic/claude-sonnet-4.7-fast-agentic",
       "vendor/claude-sonnet-5-2026-07-31",
+      "vendor/claude-opus-5-1m",
       "claude-fable-5",
       "anthropic/claude-fable-5-fast",
     ]) {

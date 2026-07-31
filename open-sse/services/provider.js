@@ -1,5 +1,6 @@
 import { PROVIDERS } from "../config/providers.js";
 import { OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
+import { getModelTargetFormat, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
 
 const OPENAI_COMPATIBLE_PREFIX = "openai-compatible-";
 const OPENAI_COMPATIBLE_DEFAULTS = {
@@ -144,6 +145,22 @@ export function resolveTransport(provider, sourceFormat) {
   const transports = config?.transports;
   if (!Array.isArray(transports) || !transports.length) return null;
   return transports.find(t => t.format === sourceFormat) || null;
+}
+
+export function resolveRequestRoute(provider, model, sourceFormat) {
+  const alias = PROVIDER_ID_TO_ALIAS[provider] || provider;
+  const modelTargetFormat = getModelTargetFormat(alias, model);
+  const transportFormat = modelTargetFormat || sourceFormat;
+  const runtimeTransport = resolveTransport(provider, transportFormat);
+
+  return {
+    targetFormat: modelTargetFormat || runtimeTransport?.format || getTargetFormat(provider),
+    runtimeTransport,
+  };
+}
+
+export function resolveRequestTargetFormat(provider, model, sourceFormat) {
+  return resolveRequestRoute(provider, model, sourceFormat).targetFormat;
 }
 
 // Check if last message is from user

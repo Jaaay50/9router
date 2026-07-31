@@ -3,6 +3,8 @@ import { shouldRefreshCredentials } from "../services/oauthCredentialManager.js"
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
+import { FORMATS } from "../translator/formats.js";
+import { finalizeAnthropicOutboundRequest } from "../utils/anthropicOutbound.js";
 
 function removeBetaFlag(headers, flag) {
   for (const key of ["anthropic-beta", "Anthropic-Beta"]) {
@@ -93,6 +95,30 @@ export class BaseExecutor {
     return body;
   }
 
+  getOutboundFormat(model, credentials) {
+    if (credentials?.requestTargetFormat) return credentials.requestTargetFormat;
+    if (credentials?.runtimeTransport?.format) return credentials.runtimeTransport.format;
+    if (this.provider?.startsWith?.("anthropic-compatible-")) return FORMATS.CLAUDE;
+    return this.config?.format || FORMATS.OPENAI;
+  }
+
+  // Final URL, body, headers, and current request headers are normalized together.
+  finalizeOutboundRequest({ url, headers, transformedBody, credentials, model, targetFormat }) {
+    const runtimeTransport = credentials?.runtimeTransport;
+    const featurePolicy = runtimeTransport != null
+      ? runtimeTransport.quirks?.anthropicBetaFeatures
+      : this.config?.quirks?.anthropicBetaFeatures;
+    return finalizeAnthropicOutboundRequest({
+      url,
+      headers,
+      transformedBody,
+      credentials,
+      provider: this.provider,
+      targetFormat: targetFormat || this.getOutboundFormat(model, credentials),
+      featurePolicy,
+    });
+  }
+
   shouldRetry(status, urlIndex) {
     return status === HTTP_STATUS.RATE_LIMITED && urlIndex + 1 < this.getFallbackCount();
   }
@@ -138,11 +164,26 @@ export class BaseExecutor {
     };
 
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
-      const url = this.buildUrl(model, stream, urlIndex, credentials);
-      const transformedBody = this.transformRequest(model, body, stream, credentials);
-      const headers = this.buildHeaders(credentials, stream, url);
+      let url = this.buildUrl(model, stream, urlIndex, credentials);
+      let transformedBody = this.transformRequest(model, body, stream, credentials);
+      let headers = this.buildHeaders(credentials, stream, url);
+      const requestFormat = this.getOutboundFormat(model, credentials);
       if (transformedBody?.thinking?.display === "summarized") {
         removeBetaFlag(headers, "redact-thinking-2026-02-12");
+      }
+      const finalized = this.finalizeOutboundRequest({
+        url,
+        headers,
+        transformedBody,
+        credentials,
+        model,
+        stream,
+        targetFormat: requestFormat,
+      });
+      if (finalized) {
+        url = finalized.url ?? url;
+        headers = finalized.headers ?? headers;
+        transformedBody = finalized.transformedBody ?? transformedBody;
       }
 
       if (!retryAttemptsByUrl[urlIndex]) retryAttemptsByUrl[urlIndex] = 0;
@@ -176,7 +217,7 @@ export class BaseExecutor {
           continue;
         }
 
-        return { response, url, headers, transformedBody };
+        return { response, url, headers, transformedBody, requestFormat };
       } catch (error) {
         clearTimeout(connectTimer);
         lastError = error;

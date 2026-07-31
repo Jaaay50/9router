@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { CodexExecutor } from "../../open-sse/executors/codex.js";
-import { DefaultExecutor } from "../../open-sse/executors/default.js";
 
 function transformBody(input, overrides = {}) {
   const executor = new CodexExecutor();
@@ -87,7 +86,7 @@ describe("CodexExecutor stateless item IDs", () => {
     });
   });
 
-  it("preserves valid IDs for every known non-tool item type and removes invalid prefixes", () => {
+  it("preserves every non-tool item ID without applying generic prefix validation", () => {
     const fixtures = [
       ["additional_tools", "at", { tools: [] }],
       ["message", "msg", { role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
@@ -112,39 +111,28 @@ describe("CodexExecutor stateless item IDs", () => {
 
     const input = transformInput(source);
 
-    fixtures.forEach(([, prefix, payload], fixtureIndex) => {
-      const items = input.slice(fixtureIndex * 5, fixtureIndex * 5 + 5);
-      expect(items[0]).toEqual(expect.objectContaining({ id: `${prefix}_valid_1`, ...payload }));
-      for (const item of items.slice(1)) {
-        expect(item).toEqual(expect.objectContaining(payload));
-        expect(item).not.toHaveProperty("id");
-      }
-    });
+    expect(input).toEqual(source);
     expect(source).toEqual(snapshot);
   });
 
-  it("validates implicit message IDs when the item only has a role", () => {
+  it("preserves implicit message IDs when the item only has a role", () => {
     const input = transformInput([
       { id: "msg_valid_1", role: "user", content: "hello" },
       { id: "item_replayed_1", role: "user", content: "again" },
     ]);
 
     expect(input[0]).toEqual({ id: "msg_valid_1", role: "user", content: "hello" });
-    expect(input[1]).toEqual({ role: "user", content: "again" });
+    expect(input[1]).toEqual({ id: "item_replayed_1", role: "user", content: "again" });
   });
 
-  it("removes generic replay IDs from unknown canonical item types but preserves plausible typed IDs", () => {
+  it("preserves IDs from unknown or future item types", () => {
     const source = [
       { type: "computer_call", id: "item_computer", call_id: "call_computer", action: { type: "screenshot" } },
       { type: "apply_patch_call", id: "patch_1", call_id: "call_patch", operation: { type: "update_file" } },
       { type: "future_response_item", id: "future_1", payload: "PAYLOAD" },
     ];
 
-    expect(transformInput(source)).toEqual([
-      { type: "computer_call", call_id: "call_computer", action: { type: "screenshot" } },
-      { type: "apply_patch_call", id: "patch_1", call_id: "call_patch", operation: { type: "update_file" } },
-      { type: "future_response_item", id: "future_1", payload: "PAYLOAD" },
-    ]);
+    expect(transformInput(source)).toEqual(source);
   });
 
   it("removes bare stored references and item_reference objects only", () => {
@@ -259,6 +247,7 @@ describe("CodexExecutor stateless item IDs", () => {
     expect(transformed).not.toBe(source);
     expect(transformed.input[0]).toEqual({
       type: "message",
+      id: "item_system",
       role: "developer",
       content: [{ type: "input_text", text: "system prompt", metadata: { keep: true } }],
     });
@@ -289,69 +278,5 @@ describe("CodexExecutor stateless item IDs", () => {
     } finally {
       logSpy.mockRestore();
     }
-  });
-});
-
-describe("OpenAI-compatible Responses stateless item IDs", () => {
-  it("applies the same prefix validation without mutating the source request", () => {
-    const executor = new DefaultExecutor("openai-compatible-responses-local");
-    const body = {
-      model: "TARGET",
-      store: false,
-      input: [
-        { type: "custom_tool_call", id: "item_probe_58", call_id: "call_58", name: "tool", input: "PAYLOAD" },
-        { type: "message", id: "item_message", role: "assistant", content: "hello" },
-        { type: "reasoning", id: "rs_valid_1", encrypted_content: "ENCRYPTED" },
-        { type: "future_response_item", id: "future_1", payload: "PAYLOAD" },
-      ],
-    };
-    const snapshot = structuredClone(body);
-
-    const transformed = executor.transformRequest("TARGET", body);
-
-    expect(body).toEqual(snapshot);
-    expect(transformed.input).toEqual([
-      { type: "custom_tool_call", call_id: "call_58", name: "tool", input: "PAYLOAD" },
-      { type: "message", role: "assistant", content: "hello" },
-      { type: "reasoning", id: "rs_valid_1", encrypted_content: "ENCRYPTED" },
-      { type: "future_response_item", id: "future_1", payload: "PAYLOAD" },
-    ]);
-  });
-
-  it("normalizes stateless IDs for static Responses providers using DefaultExecutor", () => {
-    const executor = new DefaultExecutor("perplexity-agent");
-    const body = {
-      model: "openai/gpt-5.5",
-      store: false,
-      input: [{
-        type: "custom_tool_call",
-        id: "item_probe_58",
-        call_id: "call_58",
-        name: "tool",
-        input: "PAYLOAD",
-      }],
-    };
-
-    expect(executor.transformRequest("openai/gpt-5.5", body).input).toEqual([{
-      type: "custom_tool_call",
-      call_id: "call_58",
-      name: "tool",
-      input: "PAYLOAD",
-    }]);
-  });
-
-  it("does not sanitize stateful or Chat Completions-compatible requests", () => {
-    const input = [{
-      type: "custom_tool_call",
-      id: "item_stateful",
-      call_id: "call_stateful",
-      name: "tool",
-      input: "PAYLOAD",
-    }];
-    const responsesExecutor = new DefaultExecutor("openai-compatible-responses-local");
-    const chatExecutor = new DefaultExecutor("openai-compatible-local");
-
-    expect(responsesExecutor.transformRequest("TARGET", { store: true, input }).input).toEqual(input);
-    expect(chatExecutor.transformRequest("TARGET", { store: false, input }).input).toEqual(input);
   });
 });

@@ -415,7 +415,7 @@ export class CodexExecutor extends BaseExecutor {
     // Keep system prompts in body.input as role=developer so they stay in the cacheable prefix
     convertSystemToDeveloperRole(body);
     // Strip optional tool item IDs and stored references that store=false cannot resolve.
-    const normalizedInput = normalizeStatelessResponseInput(body.input, { stripUnknownIds: true });
+    const normalizedInput = normalizeStatelessResponseInput(body.input);
     body.input = normalizedInput.input;
     const strippedIds = normalizedInput.strippedIds;
     if (Object.keys(strippedIds).length > 0) {

@@ -140,9 +140,17 @@ describe("model lock isolation", () => {
     mocks.getProviderConnections.mockResolvedValue([connection("account-a")]);
     const error = `[400]: ${JSON.stringify({ error: payload })}`;
 
-    const result = await markAccountUnavailable("account-a", 400, error, "codex", "gpt");
+    const result = await markAccountUnavailable(
+      "account-a",
+      400,
+      error,
+      "codex",
+      "gpt",
+      NOW.getTime() + 30000,
+    );
 
     expect(result).toEqual({ shouldFallback: false, cooldownMs: 0 });
+    expect(mocks.getProviderConnections).not.toHaveBeenCalled();
     expect(mocks.updateProviderConnection).not.toHaveBeenCalled();
   });
 
