@@ -8,6 +8,7 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 }));
 
 const { BaseExecutor } = await import("../../open-sse/executors/base.js");
+const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
 
 function res(status) {
   return { status, headers: { get: () => "" } };
@@ -85,6 +86,25 @@ describe("BaseExecutor.execute — network error retry/fallback", () => {
 });
 
 describe("BaseExecutor.execute — Anthropic summarized thinking headers", () => {
+  it("keeps Opus heavy-agent flags while removing redact-thinking", async () => {
+    const ex = new DefaultExecutor("claude");
+    const buildHeaders = vi.spyOn(ex, "buildHeaders");
+    fetchMock.mockResolvedValueOnce(res(200));
+
+    await ex.execute({
+      model: "claude-opus-5",
+      body: { thinking: { type: "adaptive", display: "summarized" } },
+      stream: false,
+      credentials: creds,
+    });
+
+    const betaFlags = fetchMock.mock.calls[0][1].headers["Anthropic-Beta"].split(",");
+    expect(betaFlags).toContain("advanced-tool-use-2025-11-20");
+    expect(betaFlags).toContain("effort-2025-11-24");
+    expect(betaFlags).not.toContain("redact-thinking-2026-02-12");
+    expect(buildHeaders).toHaveBeenCalledWith(creds, false, expect.any(String), "claude-opus-5");
+  });
+
   it("removes redact-thinking beta when summarized thinking is requested", async () => {
     const ex = makeExec({
       baseUrl: "https://x/api",

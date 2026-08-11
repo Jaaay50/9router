@@ -2,7 +2,7 @@
  * Shared combo (model combo) handling with fallback support
  */
 
-import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
+import { classifyProviderError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
@@ -106,15 +106,32 @@ export function detectRequiredCapabilities(body) {
   const required = new Set();
   if (!body || typeof body !== "object") return required;
 
+  const addByMime = (mime) => {
+    if (typeof mime !== "string") return;
+    if (mime.startsWith("image/")) required.add("vision");
+    else if (mime === "application/pdf") required.add("pdf");
+    else if (mime.startsWith("audio/")) required.add("audioInput");
+    else if (mime.startsWith("video/")) required.add("videoInput");
+  };
+
   const scanBlock = (b) => {
     if (!b || typeof b !== "object") return;
     const t = b.type;
     if (t === "image_url" || t === "image" || t === "input_image") required.add("vision");
-    if (t === "file" || t === "document" || t === "input_file") required.add("pdf");
+    if (t === "input_audio" || t === "audio_url" || t === "audio") required.add("audioInput");
+    if (t === "input_video" || t === "video_url" || t === "video") required.add("videoInput");
+    if (t === "file" || t === "document" || t === "input_file") {
+      // Infer modality from embedded mime when available; fall back to pdf for generic files.
+      let fmime = null;
+      if (b.input_audio?.format) fmime = `audio/${b.input_audio.format}`;
+      else if (b.file?.file_data) fmime = String(b.file.file_data).match(/^data:([^;,]+)/)?.[1];
+      else if (b.source?.media_type) fmime = b.source.media_type;
+      else if (b.source?.data) fmime = String(b.source.data).match(/^data:([^;,]+)/)?.[1];
+      if (fmime) addByMime(fmime);
+      else required.add("pdf");
+    }
     // gemini parts: inlineData/fileData carry a mime
-    const mime = b.inlineData?.mimeType || b.fileData?.mimeType;
-    if (typeof mime === "string" && mime.startsWith("image/")) required.add("vision");
-    if (mime === "application/pdf") required.add("pdf");
+    addByMime(b.inlineData?.mimeType || b.fileData?.mimeType);
   };
 
   const scanContent = (content) => {
@@ -224,9 +241,11 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {string} [options.comboName] - Name of the combo (for round-robin tracking)
  * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
+ * @param {Set<string>} [options.blockedProviders] - Provider exclusions shared by nested combos
+ * @param {Map<string|symbol, Promise>} [options.providerTails] - Per-provider queues shared by nested fusion combos
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, resolveModelProvider = null, blockedProviders = new Set(), providerTails = null }) {
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -245,13 +264,37 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   let lastError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;
+  let requestSchemaResponse = null;
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
-    log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
-      const result = await handleSingleModel(body, modelStr);
+      const provider = resolveModelProvider ? await resolveModelProvider(modelStr) : null;
+      if (provider && blockedProviders.has(provider)) {
+        log.info("COMBO", `Skipping model ${modelStr}: provider ${provider} rejected request schema`);
+        continue;
+      }
+      log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
+      let blockedBefore;
+      let result;
+      if (provider && providerTails) {
+        const previous = providerTails.get(provider) || Promise.resolve();
+        const call = previous.catch(() => {}).then(() => {
+          if (blockedProviders.has(provider)) return null;
+          blockedBefore = new Set(blockedProviders);
+          return handleSingleModel(body, modelStr, blockedProviders, providerTails);
+        });
+        providerTails.set(provider, call);
+        result = await call;
+        if (!result) {
+          log.info("COMBO", `Skipping model ${modelStr}: provider ${provider} rejected request schema`);
+          continue;
+        }
+      } else {
+        blockedBefore = new Set(blockedProviders);
+        result = await handleSingleModel(body, modelStr, blockedProviders, providerTails);
+      }
       
       // Success (2xx) - return response
       if (result.ok) {
@@ -262,8 +305,10 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       // Extract error info from response
       let errorText = result.statusText || "";
       let retryAfter = null;
+      let errorPayload = null;
       try {
         const errorBody = await result.clone().json();
+        errorPayload = errorBody;
         errorText = errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
         retryAfter = errorBody?.retryAfter || null;
       } catch {
@@ -280,10 +325,17 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         try { errorText = JSON.stringify(errorText); } catch { errorText = String(errorText); }
       }
 
-      // Check if should fallback to next model
-      const { shouldFallback, cooldownMs } = checkFallbackError(result.status, errorText);
+      const nestedSchemaProvider = provider ? null : [...blockedProviders].find((item) => !blockedBefore.has(item));
+      const errorProvider = provider || nestedSchemaProvider;
+      const classification = classifyProviderError(errorProvider, result.status, errorPayload || errorText);
+      if (classification.comboScope === "provider") {
+        if (!requestSchemaResponse) requestSchemaResponse = result;
+        if (errorProvider) blockedProviders.add(errorProvider);
+        log.warn("COMBO", `Provider ${errorProvider || "unknown"} rejected the request schema`, { status: result.status });
+        continue;
+      }
 
-      if (!shouldFallback) {
+      if (!classification.accountFallback) {
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
         return result;
       }
@@ -291,10 +343,10 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       // For transient errors (503/502/504), wait for cooldown before falling through
       // so a briefly-overloaded provider gets a chance to recover rather than being
       // skipped immediately (fixes: combo falls through on transient 503)
-      if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
+      if (classification.cooldownMs && classification.cooldownMs > 0 && classification.cooldownMs <= 5000 &&
           (result.status === 503 || result.status === 502 || result.status === 504)) {
-        log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
-        await new Promise(r => setTimeout(r, cooldownMs));
+        log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${classification.cooldownMs}ms before next`);
+        await new Promise(r => setTimeout(r, classification.cooldownMs));
       }
 
       // Fallback to next model
@@ -308,6 +360,8 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
     }
   }
+
+  if (requestSchemaResponse) return requestSchemaResponse;
 
   // All models failed
   // Use 503 (Service Unavailable) rather than 406 (Not Acceptable) — 406 implies
@@ -491,10 +545,24 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
  * @param {string} [options.comboName] - Combo name (logging)
  * @param {string} [options.judgeModel] - Judge model; falls back to panel[0]
  * @param {Object} [options.tuning] - Override FUSION_DEFAULTS (minPanel, grace, timeout)
+ * @param {Function} [options.resolveModelProvider] - Resolve a model string to its provider
+ * @param {Set<string>} [options.blockedProviders] - Provider exclusions shared by nested combos
+ * @param {Map<string|symbol, Promise>} [options.providerTails] - Per-provider queues shared by nested fusion combos
  * @returns {Promise<Response>}
  */
-export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning }) {
+export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning, resolveModelProvider = null, blockedProviders = new Set(), providerTails = new Map() }) {
   const panel = Array.isArray(models) ? models.filter(Boolean) : [];
+  const resolveProvider = async (model) => {
+    if (!resolveModelProvider) return null;
+    try { return await resolveModelProvider(model); } catch { return null; }
+  };
+  const enqueueProviderCall = (provider, unknownKey, task) => {
+    const queueKey = provider || unknownKey;
+    const previous = providerTails.get(queueKey) || Promise.resolve();
+    const call = previous.catch(() => {}).then(task);
+    providerTails.set(queueKey, call);
+    return call;
+  };
   if (panel.length === 0) {
     return new Response(
       JSON.stringify({ error: { message: "Fusion combo has no models" } }),
@@ -504,7 +572,16 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
 
   // A single-model fusion has nothing to fuse — just answer directly.
   if (panel.length === 1) {
-    return handleSingleModel(body, panel[0]);
+    const provider = await resolveProvider(panel[0]);
+    return enqueueProviderCall(provider, Symbol("unknown-provider"), () => {
+      if (provider && blockedProviders.has(provider)) {
+        return new Response(
+          JSON.stringify({ error: { message: `Provider ${provider} rejected the request schema` } }),
+          { status: 503, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+        );
+      }
+      return handleSingleModel(body, panel[0], undefined, blockedProviders, providerTails);
+    });
   }
 
   const cfg = { ...FUSION_DEFAULTS, ...(tuning || {}) };
@@ -524,8 +601,47 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
 
   const t0 = Date.now();
-  const calls = panel.map((m) => withTimeout(handleSingleModel(panelBody, m, true), cfg.panelHardTimeoutMs));
+  let requestSchemaResponse = null;
+  let acceptingPanelCalls = true;
+  const providers = resolveModelProvider
+    ? await Promise.all(panel.map(resolveProvider))
+    : panel.map(() => null);
+  const unknownProviderQueue = Symbol("unknown-provider");
+  const recordSchemaFailure = async (result, provider, blockedBefore) => {
+    let errorPayload = null;
+    let errorText = result?.statusText || "";
+    try {
+      errorPayload = await result.clone().json();
+      errorText = errorPayload?.error?.message || errorPayload?.error || errorPayload?.message || errorText;
+    } catch { /* non-JSON provider error */ }
+    const nestedSchemaProvider = provider ? null : [...blockedProviders].find((item) => !blockedBefore.has(item));
+    const errorProvider = provider || nestedSchemaProvider;
+    const classification = classifyProviderError(errorProvider, result?.status, errorPayload || errorText);
+    if (classification.comboScope !== "provider") return false;
+    if (!requestSchemaResponse) requestSchemaResponse = result;
+    if (errorProvider) blockedProviders.add(errorProvider);
+    return true;
+  };
+  const calls = panel.map((model, index) => {
+    const provider = providers[index];
+    const unknownKey = resolveModelProvider ? unknownProviderQueue : Symbol(`model-${index}`);
+    return enqueueProviderCall(provider, unknownKey, async () => {
+      if (!acceptingPanelCalls) return { __dropped: true };
+      if (provider && blockedProviders.has(provider)) return { __schemaSkipped: true };
+
+      const blockedBefore = new Set(blockedProviders);
+      const result = await withTimeout(
+        handleSingleModel(panelBody, model, true, blockedProviders, providerTails),
+        cfg.panelHardTimeoutMs
+      );
+      if (acceptingPanelCalls && !result?.ok && !result?.__timeout && !result?.__error) {
+        await recordSchemaFailure(result, provider, blockedBefore);
+      }
+      return result;
+    });
+  });
   const settled = await collectPanel(calls, { ...cfg, minPanel });
+  acceptingPanelCalls = false;
   log.info("FUSION", `fan-out collected in ${Date.now() - t0}ms`);
 
   // 2. Collect successful answers.
@@ -534,6 +650,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
     const res = settled[i];
     const model = panel[i];
     if (!res) { log.warn("FUSION", `Panel ${model} dropped (straggler/timeout)`); continue; }
+    if (res.__dropped || res.__schemaSkipped) { log.warn("FUSION", `Panel ${model} skipped`); continue; }
     if (res.__timeout) { log.warn("FUSION", `Panel ${model} timed out`); continue; }
     if (res.__error) { log.warn("FUSION", `Panel ${model} threw`, { error: res.__error?.message || String(res.__error) }); continue; }
     if (!res.ok) { log.warn("FUSION", `Panel ${model} failed`, { status: res.status }); continue; }
@@ -541,7 +658,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
       const json = await res.clone().json();
       const text = extractPanelText(json);
       if (text) {
-        answers.push({ model, text });
+        answers.push({ model, text, response: res });
         log.info("FUSION", `Panel ${model} ok (${text.length} chars)`);
       } else {
         log.warn("FUSION", `Panel ${model} returned empty content`);
@@ -553,6 +670,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
 
   // 3. Degrade gracefully when the panel is too thin to fuse.
   if (answers.length === 0) {
+    if (requestSchemaResponse) return requestSchemaResponse;
     log.warn("FUSION", "All panel models failed");
     return new Response(
       JSON.stringify({ error: { message: "All fusion panel models failed" } }),
@@ -561,11 +679,37 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
   if (answers.length === 1) {
     log.info("FUSION", `Only ${answers[0].model} succeeded — answering directly (no fusion)`);
-    return handleSingleModel(body, answers[0].model);
+    const answerProvider = await resolveProvider(answers[0].model);
+    if (answerProvider && blockedProviders.has(answerProvider)) return answers[0].response;
+    const result = await enqueueProviderCall(answerProvider, Symbol("unknown-provider"), () => {
+      if (answerProvider && blockedProviders.has(answerProvider)) return null;
+      return handleSingleModel(body, answers[0].model, undefined, blockedProviders, providerTails);
+    });
+    return result || requestSchemaResponse || answers[0].response;
   }
 
   // 4. Judge analyzes + writes one final answer (streams to client if requested).
   const judgeBody = appendUserTurn(body, buildJudgePrompt(answers));
-  log.info("FUSION", `Judging ${answers.length} answers with ${judge}`);
-  return handleSingleModel(judgeBody, judge);
+  const judgeCandidates = [judge, ...answers.map(({ model }) => model)];
+  const attemptedProviders = new Set();
+  const attemptedModels = new Set();
+  for (const candidate of judgeCandidates) {
+    if (attemptedModels.has(candidate)) continue;
+    attemptedModels.add(candidate);
+    const provider = await resolveProvider(candidate);
+    if (provider && (blockedProviders.has(provider) || attemptedProviders.has(provider))) continue;
+    if (provider) attemptedProviders.add(provider);
+
+    log.info("FUSION", `Judging ${answers.length} answers with ${candidate}`);
+    const blockedBefore = new Set(blockedProviders);
+    const result = await enqueueProviderCall(provider, Symbol("unknown-provider"), () => {
+      if (provider && blockedProviders.has(provider)) return null;
+      return handleSingleModel(judgeBody, candidate, undefined, blockedProviders, providerTails);
+    });
+    if (!result) continue;
+    if (result.ok) return result;
+    const isSchemaFailure = await recordSchemaFailure(result, provider, blockedBefore);
+    if (!isSchemaFailure) return result;
+  }
+  return requestSchemaResponse || answers[0].response;
 }
