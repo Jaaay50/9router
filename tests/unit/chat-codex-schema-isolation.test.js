@@ -168,6 +168,53 @@ describe("Codex schema 400 account isolation", () => {
     expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
   });
 
+  it("keeps provider blocks through an active capacity adapter wrapper", async () => {
+    mocks.getSettings.mockResolvedValue({
+      requireApiKey: false,
+      capacityAdapter: {
+        vision: {
+          enabled: true,
+          models: ["codex/gpt-5.6-sol", "nested/mimo-v2.5"],
+        },
+      },
+    });
+    mocks.getComboModels.mockImplementation(async (model) => {
+      if (model === "nested/mimo-v2.5") return ["codex/gpt-5.6-terra", "other/vision-model"];
+      return null;
+    });
+    mocks.getModelInfo.mockImplementation(async (model) => {
+      if (model === "nested/mimo-v2.5") return { provider: null, model };
+      const [provider, resolvedModel] = model.split("/");
+      return { provider, model: resolvedModel };
+    });
+    mocks.handleChatCore.mockImplementation(async ({ modelInfo }) => {
+      if (modelInfo.provider === "codex") {
+        return {
+          success: false,
+          status: 400,
+          error: SCHEMA_ERROR,
+          response: new Response("synthetic", { status: 400 }),
+          upstreamResponse: new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 }),
+        };
+      }
+      return { success: true, response: new Response("ok", { status: 200 }) };
+    });
+
+    const response = await handleChat(request({
+      model: "other/text-only",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }],
+      }],
+    }));
+    const calledProviders = mocks.handleChatCore.mock.calls.map(([options]) => options.modelInfo.provider);
+
+    expect(response.ok).toBe(true);
+    expect(calledProviders).toEqual(["codex", "other"]);
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
   it("shares provider blocks with a nested fusion combo", async () => {
     const schemaResponse = new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 });
     mocks.getSettings.mockResolvedValue({
@@ -289,29 +336,31 @@ describe("Codex schema 400 account isolation", () => {
     expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
   });
 
-  it("shares provider queues from fusion into a nested fallback combo", async () => {
-    let activeCodexCalls = 0;
-    let maxActiveCodexCalls = 0;
+  it("shares provider queues through an active adapter into a nested fallback combo", async () => {
+    let activeOtherCalls = 0;
+    let maxActiveOtherCalls = 0;
     mocks.getSettings.mockResolvedValue({
       requireApiKey: false,
       comboStrategies: { outerFusion: { fallbackStrategy: "fusion" } },
+      capacityAdapter: {
+        vision: { enabled: true, models: ["codex/gpt-5.6-sol"] },
+      },
     });
     mocks.getComboModels.mockImplementation(async (model) => {
-      if (model === "outerFusion") return ["cx/gpt-5.6-sol", "innerFallback", "other/a"];
-      if (model === "innerFallback") return ["cx/gpt-5.6-codex", "other/b"];
+      if (model === "outerFusion") return ["other/a", "innerFallback", "third/c"];
+      if (model === "innerFallback") return ["deepNested"];
+      if (model === "deepNested") return ["other/vision-model"];
       return null;
     });
     mocks.getModelInfo.mockImplementation(async (model) => {
-      if (model === "outerFusion" || model === "innerFallback") return { provider: null, model };
+      if (model === "outerFusion" || model === "innerFallback" || model === "deepNested") {
+        return { provider: null, model };
+      }
       const [prefix, resolvedModel] = model.split("/");
-      return { provider: prefix === "cx" ? "codex" : "other", model: resolvedModel };
+      return { provider: prefix, model: resolvedModel };
     });
     mocks.handleChatCore.mockImplementation(async ({ modelInfo }) => {
       if (modelInfo.provider === "codex") {
-        activeCodexCalls += 1;
-        maxActiveCodexCalls = Math.max(maxActiveCodexCalls, activeCodexCalls);
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        activeCodexCalls -= 1;
         return {
           success: false,
           status: 400,
@@ -319,6 +368,12 @@ describe("Codex schema 400 account isolation", () => {
           response: new Response("synthetic", { status: 400 }),
           upstreamResponse: new Response(JSON.stringify({ error: { message: SCHEMA_ERROR } }), { status: 400 }),
         };
+      }
+      if (modelInfo.provider === "other") {
+        activeOtherCalls += 1;
+        maxActiveOtherCalls = Math.max(maxActiveOtherCalls, activeOtherCalls);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        activeOtherCalls -= 1;
       }
       return {
         success: true,
@@ -328,12 +383,20 @@ describe("Codex schema 400 account isolation", () => {
       };
     });
 
-    const response = await handleChat(request({ model: "outerFusion" }));
+    const response = await handleChat(request({
+      model: "outerFusion",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }],
+      }],
+    }));
     const calledProviders = mocks.handleChatCore.mock.calls.map(([options]) => options.modelInfo.provider);
 
     expect(response.ok).toBe(true);
-    expect(maxActiveCodexCalls).toBe(1);
+    expect(maxActiveOtherCalls).toBe(1);
     expect(calledProviders.filter((provider) => provider === "codex")).toHaveLength(1);
+    expect(calledProviders.filter((provider) => provider === "other").length).toBeGreaterThanOrEqual(2);
     expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
   });
 
