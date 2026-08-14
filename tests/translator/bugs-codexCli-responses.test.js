@@ -1,7 +1,7 @@
 // Real Codex CLI requests (OpenAI Responses API: { input:[], instructions }) → providers.
 import { describe, it, expect } from "vitest";
 import "./registerAll.js";
-import { translateRequest } from "../../open-sse/translator/index.js";
+import { initState, translateRequest, translateResponse } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
 
 const R2O = (body) => translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, "m", body, true, null, null);
@@ -71,5 +71,78 @@ describe("OpenAI → Codex Responses (reverse)", () => {
     });
     const fc = out.input.find((i) => i.type === "function_call");
     expect(fc.call_id.length).toBeLessThanOrEqual(64);
+  });
+});
+
+describe("OpenAI Chat stream → Codex Responses", () => {
+  const translate = (chunk, state) =>
+    translateResponse(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, chunk, state);
+
+  it("waits for the usage-only terminal chunk before completing", () => {
+    const state = initState(FORMATS.OPENAI_RESPONSES);
+
+    translate({
+      id: "chatcmpl-1",
+      choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: null }],
+    }, state);
+
+    const finishEvents = translate({
+      id: "chatcmpl-1",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    }, state);
+    expect(finishEvents.some((item) => item.event === "response.completed")).toBe(false);
+
+    const usageEvents = translate({
+      id: "chatcmpl-1",
+      choices: [],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        total_tokens: 15,
+        prompt_tokens_details: { cached_tokens: 3 },
+      },
+    }, state);
+
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]).toMatchObject({
+      event: "response.completed",
+      data: {
+        type: "response.completed",
+        response: {
+          usage: {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            input_tokens_details: { cached_tokens: 3 },
+          },
+        },
+      },
+    });
+  });
+
+  it("does not fabricate usage when the upstream omits token fields", () => {
+    const state = initState(FORMATS.OPENAI_RESPONSES);
+
+    translate({
+      id: "chatcmpl-2",
+      choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: null }],
+    }, state);
+    const finishEvents = translate({
+      id: "chatcmpl-2",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    }, state);
+    expect(finishEvents.some((item) => item.event === "response.completed")).toBe(false);
+
+    const emptyUsageEvents = translate({
+      id: "chatcmpl-2",
+      choices: [],
+      usage: {},
+    }, state);
+    expect(emptyUsageEvents.some((item) => item.event === "response.completed")).toBe(false);
+
+    const flushEvents = translate(null, state);
+    const completed = flushEvents.find((item) => item.event === "response.completed");
+    expect(completed).toBeDefined();
+    expect(completed.data.response.usage).toBeUndefined();
   });
 });

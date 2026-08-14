@@ -18,16 +18,23 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
   if (!chunk) {
     return flushEvents(state);
   }
-  
-  if (!chunk.choices?.length) return [];
-  
+
   const events = [];
   const nextSeq = () => ++state.seq;
-  
+
   const emit = (eventType, data) => {
     data.sequence_number = nextSeq();
     events.push({ event: eventType, data });
   };
+
+  if (chunk.usage && typeof chunk.usage === "object") {
+    state.usage = chunk.usage;
+  }
+
+  if (!chunk.choices?.length) {
+    if (state.chatFinishSeen && toResponsesUsage(state.usage)) sendCompleted(state, emit);
+    return events;
+  }
 
   const choice = chunk.choices[0];
   const idx = choice.index || 0;
@@ -109,10 +116,11 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
 
   // Handle finish_reason
   if (choice.finish_reason) {
+    state.chatFinishSeen = true;
     for (const i in state.msgItemAdded) closeMessage(state, emit, i);
     closeReasoning(state, emit);
     for (const i in state.funcCallIds) closeToolCall(state, emit, i);
-    sendCompleted(state, emit);
+    if (toResponsesUsage(state.usage)) sendCompleted(state, emit);
   }
 
   return events;
@@ -368,6 +376,7 @@ function closeToolCall(state, emit, idx) {
 function sendCompleted(state, emit) {
   if (!state.completedSent) {
     state.completedSent = true;
+    const usage = toResponsesUsage(state.usage);
     emit("response.completed", {
       type: "response.completed",
       response: {
@@ -376,10 +385,31 @@ function sendCompleted(state, emit) {
         created_at: state.created,
         status: "completed",
         background: false,
-        error: null
+        error: null,
+        ...(usage ? { usage } : {})
       }
     });
   }
+}
+
+function toResponsesUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+
+  const inputTokens = usage.prompt_tokens;
+  const outputTokens = usage.completion_tokens;
+  const totalTokens = usage.total_tokens;
+  const cachedTokens = usage.prompt_tokens_details?.cached_tokens ?? 0;
+  const counts = [inputTokens, outputTokens, totalTokens, cachedTokens];
+
+  if (!counts.every((value) => Number.isSafeInteger(value) && value >= 0)) return null;
+  if (inputTokens + outputTokens !== totalTokens || cachedTokens > inputTokens) return null;
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokens,
+    input_tokens_details: { cached_tokens: cachedTokens }
+  };
 }
 
 function flushEvents(state) {
