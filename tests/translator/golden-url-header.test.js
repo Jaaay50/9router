@@ -5,6 +5,10 @@ import { describe, it, expect } from "vitest";
 import { PROVIDERS } from "../../open-sse/config/providers.js";
 import { DefaultExecutor } from "../../open-sse/executors/default.js";
 
+const INTENTIONAL_HEADER_DRIFT = {
+  anthropic: new Set(["Anthropic-Version"]),
+};
+
 // Credentials mẫu cố định (deterministic) — KHÔNG dùng Date.now/random.
 const API_KEY_CRED = { apiKey: "sk-test-APIKEY", providerSpecificData: {} };
 const OAUTH_CRED = { accessToken: "tok-test-ACCESS", providerSpecificData: {} };
@@ -24,9 +28,10 @@ const SPECIALIZED = new Set([
 ]);
 
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
-function sanitize(headers) {
+function sanitize(headers, provider) {
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
+    if (INTENTIONAL_HEADER_DRIFT[provider]?.has(k)) continue;
     out[k] = typeof v === "string"
       ? v.replace(/Bearer .+/, "Bearer <TOK>")
           .replace(/sk-test-APIKEY|tok-test-ACCESS/g, "<CRED>")
@@ -58,9 +63,9 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
     it(`${pid} → headers (apiKey / oauth)`, () => {
       const ex = new DefaultExecutor(pid);
       const snap = {
-        apiKey: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, true))),
-        oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
-        nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false))),
+        apiKey: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, true), pid)),
+        oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true), pid)),
+        nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false), pid)),
       };
       expect(snap).toMatchSnapshot();
     });
