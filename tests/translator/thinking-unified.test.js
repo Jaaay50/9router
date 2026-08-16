@@ -191,11 +191,43 @@ describe("applyThinking per provider format", () => {
     ["gpt-5.6-luna", "ultra", "max"],
   ])("normalizes Codex %s effort %s to %s", (model, effort, expected) => {
     const out = apply("openai-responses", model, { reasoning: { effort } }, "codex");
-    expect(out.reasoning_effort).toBe(expected);
+    expect(out.reasoning_effort).toBeUndefined();
+    expect(out.reasoning.effort).toBe(expected);
   });
   it("applies a supported Codex Ultra suffix", () => {
     const out = apply("openai-responses", "gpt-5.6-sol(ultra)", {}, "codex");
-    expect(out.reasoning_effort).toBe("ultra");
+    expect(out.reasoning_effort).toBeUndefined();
+    expect(out.reasoning.effort).toBe("ultra");
+  });
+  it("nests effort for openai-compatible Responses while preserving siblings", () => {
+    const out = apply(
+      "openai-responses",
+      "gpt-5.6-sol",
+      { reasoning: { effort: "high", summary: "detailed", mode: "pro" } },
+      "openai-compatible-responses-test"
+    );
+    expect(out.reasoning_effort).toBeUndefined();
+    expect(out.reasoning).toEqual({ effort: "high", summary: "detailed", mode: "pro" });
+  });
+  it("nests effort for the singular openai-response format", () => {
+    const out = apply(
+      "openai-response",
+      "gpt-5.6-sol",
+      { reasoning_effort: "high" },
+      "openai-compatible-responses-test"
+    );
+    expect(out.reasoning_effort).toBeUndefined();
+    expect(out.reasoning).toEqual({ effort: "high" });
+  });
+  it("keeps Chat Completions reasoning_effort flat", () => {
+    const out = apply(
+      "openai",
+      "gpt-5.6-sol",
+      { reasoning_effort: "high" },
+      "openai-compatible-chat-test"
+    );
+    expect(out.reasoning_effort).toBe("high");
+    expect(out.reasoning).toBeUndefined();
   });
   it("keeps Codex-only GPT-5.6 levels out of Kiro translation", () => {
     const out = apply("openai", "gpt-5.6-sol", { reasoning_effort: "max" }, "kiro");

@@ -137,6 +137,27 @@ describe("openai ↔ responses multi-turn reasoning", () => {
   });
 });
 
+describe("OpenAI Chat → Responses reasoning shape", () => {
+  it("nests reasoning effort for openai-compatible Responses providers", () => {
+    const out = translateRequest(
+      "openai",
+      "openai-responses",
+      "gpt-5.6-sol",
+      {
+        model: "gpt-5.6-sol",
+        messages: [{ role: "user", content: "hi" }],
+        reasoning_effort: "high",
+      },
+      true,
+      {},
+      "openai-compatible-responses-test"
+    );
+
+    expect(out.reasoning_effort).toBeUndefined();
+    expect(out.reasoning).toEqual({ effort: "high", summary: "auto" });
+  });
+});
+
 describe("GrokCliExecutor multi-turn input", () => {
   it("keeps native Grok reasoning and item ids", () => {
     _resetGrokCliTurnStore();

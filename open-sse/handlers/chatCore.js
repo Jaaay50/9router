@@ -159,7 +159,9 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     translatedBody = { ...body, model: stripThinkingSuffix(upstreamModel) };
     if (provider === "codex") {
       const suffixThinking = {};
-      applyThinking(sourceFormat, upstreamModel, suffixThinking, provider);
+      // This branch reads the flat key and nests it below, so keep the scratch
+      // normalization in Chat Completions format even for Responses clients.
+      applyThinking(FORMATS.OPENAI, upstreamModel, suffixThinking, provider);
       if (suffixThinking.reasoning_effort) {
         const reasoning = translatedBody.reasoning;
         translatedBody.reasoning = {
