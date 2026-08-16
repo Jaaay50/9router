@@ -96,6 +96,17 @@ describe("DefaultExecutor.buildHeaders() — claude provider", () => {
   });
 });
 
+describe("DefaultExecutor.buildHeaders() — anthropic provider", () => {
+  it("includes the context management beta flag", async () => {
+    const mod = await import("open-sse/executors/default.js");
+    const DefaultExecutor = mod.DefaultExecutor || mod.default;
+    const headers = new DefaultExecutor("anthropic").buildHeaders({ apiKey: "sk-test" }, true);
+    const betaFlags = headers["Anthropic-Beta"].split(",").map(s => s.trim());
+
+    expect(betaFlags).toContain("context-management-2025-06-27");
+  });
+});
+
 // ─── anthropic-compatible header stripping ────────────────────────────────────
 
 describe("DefaultExecutor.buildHeaders() — anthropic-compatible stripping", () => {
