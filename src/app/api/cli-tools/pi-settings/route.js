@@ -126,6 +126,11 @@ export async function POST(request) {
 
     if (!existing.providers) existing.providers = {};
 
+    // Keep whatever the 9router block already carries: the POST body has no
+    // field for "api" or for a key the caller did not re-select, and reading
+    // the previous block is the only way to leave them alone.
+    const existingProvider = existing.providers["9router"] || {};
+
     const normalizedBaseUrl = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
     let modelList = [];
     if (Array.isArray(rawBody.models) && rawBody.models.length > 0) {
@@ -145,10 +150,15 @@ export async function POST(request) {
       modelList = [{ id: modelId, name: modelId, contextWindow: 128000, maxTokens: 16384 }];
     }
 
+    // The card sends the literal placeholder "sk_9router" when no key is selected
+    // (#4399). Writing that placeholder means Pi 401s on every request, so it has
+    // to be resolved here like the other CLI-tool routes do.
+    const resolvedApiKey = await resolveCliApiKey(apiKey);
+
     existing.providers["9router"] = {
       ...existingProvider,
       baseUrl: normalizedBaseUrl,
-      apiKey: apiKey || existingProvider.apiKey || await resolveCliApiKey(null),
+      apiKey: resolvedApiKey || existingProvider.apiKey || "",
       api: existingProvider.api || "openai-completions",
       models: modelList,
     };
